@@ -1,6 +1,7 @@
 # TravelOps
 
-TravelOps 是具备持久化执行、幂等、证据链、审计轨迹的单机旅游 Agent 基础平台。 
+TravelOps 是具备持久化执行、幂等、证据链、审计轨迹的旅游 Agent 基础平台。 
+以多模态证据链、全链路可审计、4层可恢复执行等为核心，覆盖对话、工具调用、Skill、双层记忆、行程规划与重规划、质量审查、执行轨迹与持久化任务队列，实现Agent 服务的任务崩溃后的恢复与续跑、副作用工具的重试幂、附件内容的证据可审计等。
 
 ## 项目结构
 
@@ -25,7 +26,6 @@ src/
 ├── session_memory/         # 当前 user_id + thread_id 的持久化会话记忆
 ├── prompts/                # Prompt 资源
 └── skills/                 # Agent Skill 资源
-tests/                      # 单元测试
 ```
 
 ## 统一入口位置：
