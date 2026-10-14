@@ -52,7 +52,6 @@ uvicorn app.api.main:app --reload
 ```powershell
 python -m app.worker
 ```
-conda activate myvenv
 默认地址为 `http://127.0.0.1:8000`
 
 
