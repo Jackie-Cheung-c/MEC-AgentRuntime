@@ -1,0 +1,18 @@
+langchain
+langchain-mcp-adapters
+langchain-chroma
+langchain-community
+langchain-openai
+langgraph-checkpoint-sqlite aiosqlite
+fastapi
+minio
+pillow
+pydantic
+python-multipart
+uvicorn
+tiktoken
+jieba
+PyJWT
+argon2-cffi
+aiosqlite
+dashscope

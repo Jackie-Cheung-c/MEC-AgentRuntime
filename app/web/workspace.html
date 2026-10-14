@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>TravelTrace | 多模态旅行工作台</title>
+  <link rel="stylesheet" href="/static/workspace.css?v=20260922-auth-2">
+</head>
+<body>
+  <div id="auth-gate" class="auth-gate">
+    <form id="auth-form" class="auth-dialog">
+      <div class="auth-brand">
+        <span class="brand-mark">TT</span>
+        <div><strong>TravelTrace</strong><small>账号登录</small></div>
+      </div>
+      <h1 id="auth-title">登录 TravelTrace</h1>
+      <p id="auth-copy">登录后，会话、附件、行程和长期记忆都会绑定到你的账号。</p>
+      <label class="auth-field" id="auth-name-field" hidden>
+        <span>显示名称</span>
+        <input id="auth-name" type="text" maxlength="80" autocomplete="name">
+      </label>
+      <label class="auth-field">
+        <span>邮箱</span>
+        <input id="auth-email" type="email" maxlength="254" autocomplete="email" required>
+      </label>
+      <label class="auth-field">
+        <span>密码</span>
+        <input id="auth-password" type="password" maxlength="128" autocomplete="current-password" required>
+      </label>
+      <p id="auth-error" class="auth-error" role="alert"></p>
+      <button id="auth-submit" class="primary-button" type="submit">登录</button>
+      <button id="auth-toggle" class="auth-toggle" type="button">没有账号？创建账号</button>
+    </form>
+  </div>
+  <div class="app-shell" id="app-shell">
+
+    <!-- ============ 侧边栏 ============ -->
+    <aside class="sidebar" id="sidebar">
+      <header class="sidebar-head">
+        <a class="brand" href="/">
+          <span class="brand-mark">TT</span>
+          <span class="brand-text"><strong>TravelTrace</strong><small>Multimodal Agent</small></span>
+        </a>
+        <button id="sidebar-toggle" class="ghost-icon" type="button" title="收起侧边栏" aria-label="收起侧边栏">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
+        </button>
+      </header>
+
+      <button id="new-chat" class="new-chat" type="button"><span class="plus">＋</span>新建对话</button>
+
+      <nav class="view-nav" aria-label="工作区">
+        <button class="nav-item active" data-view="chat" type="button">
+          <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11.5a8.4 8.4 0 0 1-9 8.4L6 21l1.2-3.6A8.4 8.4 0 1 1 21 11.5Z"/></svg></span>
+          智能对话
+        </button>
+        <button class="nav-item" data-view="upload" type="button">
+          <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0L8 8m4-4 4 4"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg></span>
+          附件上传
+        </button>
+        <button class="nav-item" data-view="review" type="button">
+          <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 3h8l4 4v14H6z"/><path d="M9.5 13.5l2 2 3.5-4"/></svg></span>
+          证据审核
+        </button>
+        <button class="nav-item" data-view="memory" type="button">
+          <span class="nav-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3a4 4 0 0 0-4 4v1a3 3 0 0 0 0 6v1a4 4 0 0 0 8 0v-1a3 3 0 0 0 0-6V7a4 4 0 0 0-4-4Z"/><path d="M12 3v18"/></svg></span>
+          长期记忆
+        </button>
+      </nav>
+
+      <section class="history-block">
+        <div class="side-heading"><span>历史会话</span><button id="refresh-threads" type="button">刷新</button></div>
+        <div id="thread-list" class="thread-list"><p>暂无会话</p></div>
+      </section>
+
+      <section class="context-block">
+        <div class="side-heading"><span>当前附件</span><button id="clear-attachment" type="button">清除</button></div>
+        <div id="active-attachment" class="active-attachment empty">尚未选择附件</div>
+      </section>
+
+      <section class="recent-block">
+        <div class="side-heading"><span>最近附件</span><button id="refresh-list" type="button">刷新</button></div>
+        <div id="recent-list" class="recent-list"><p>暂无附件</p></div>
+      </section>
+
+      <footer class="sidebar-foot">
+        <div class="user-control">
+          <span>当前用户</span>
+          <strong id="user-display">未登录</strong>
+          <button id="logout-button" type="button">退出登录</button>
+        </div>
+      </footer>
+    </aside>
+
+    <!-- ============ 主区域 ============ -->
+    <main class="main-shell">
+      <header class="topbar">
+        <div class="topbar-left">
+          <button id="sidebar-open" class="ghost-icon" type="button" title="展开侧边栏" aria-label="展开侧边栏" hidden>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
+          </button>
+          <div>
+            <p id="view-kicker" class="kicker">TRAVELOPS AGENT</p>
+            <h1 id="view-title">智能对话</h1>
+          </div>
+        </div>
+        <div id="service-state" class="service-state"><i></i><span>服务已连接</span></div>
+      </header>
+
+      <div id="global-message" class="global-message" role="status" aria-live="polite"></div>
+
+      <!-- ---------- 智能对话 ---------- -->
+      <section id="chat-view" class="view" data-view-panel="chat">
+        <div id="chat-scroll" class="chat-scroll">
+          <div class="chat-column">
+            <div id="chat-empty" class="chat-empty">
+              <div class="chat-symbol">TT</div>
+              <h2>今天想处理哪段行程？</h2>
+              <p>直接提问，或先上传旅行凭证并完成字段审核。</p>
+              <div class="prompt-grid">
+                <button type="button" data-prompt="根据当前凭证整理我的行程安排"><strong>整理凭证中的行程</strong><small>从已审核字段生成行程</small></button>
+                <button type="button" data-prompt="检查当前行程是否存在时间冲突"><strong>检查行程时间冲突</strong><small>比对航班、酒店与景点时间</small></button>
+                <button type="button" data-prompt="总结当前凭证中的费用信息"><strong>汇总凭证费用</strong><small>按类别统计凭证金额</small></button>
+              </div>
+            </div>
+            <div id="messages" class="messages"></div>
+          </div>
+        </div>
+
+        <div class="composer-dock">
+          <div class="chat-column">
+            <div id="composer-attachment" class="composer-attachment" hidden>
+              <div><span id="composer-file">-</span><small id="composer-status">-</small></div>
+              <button id="open-review" type="button">查看证据</button>
+            </div>
+            <form id="chat-form" class="composer">
+              <textarea id="chat-input" rows="1" placeholder="给 TravelTrace 发送消息" maxlength="4000"></textarea>
+              <div class="composer-actions">
+                <button id="chat-upload-shortcut" class="icon-command" type="button" title="上传附件" aria-label="上传附件">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>
+                </button>
+                <span>Enter 发送，Shift + Enter 换行</span>
+                <button id="send-button" class="send-button" type="submit" title="发送" aria-label="发送">
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5m0 0-6 6m6-6 6 6"/></svg>
+                </button>
+              </div>
+            </form>
+            <p class="composer-hint">内容由 AI 生成，请仔细甄别</p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ---------- 附件上传 ---------- -->
+      <section id="upload-view" class="view" data-view-panel="upload" hidden>
+        <div class="upload-layout">
+          <section class="upload-main">
+            <div id="drop-zone" class="drop-zone">
+              <input id="file-input" type="file" accept="image/jpeg,image/png,image/webp" hidden>
+              <div class="upload-mark">＋</div>
+              <h2>上传旅行凭证</h2>
+              <p>将机票、车票、酒店订单、通知或收据拖到这里</p>
+              <button id="choose-file" class="secondary-button" type="button">选择图片</button>
+              <small>支持 JPEG、PNG、WebP，最大 10 MiB</small>
+            </div>
+
+            <div id="upload-selection" class="upload-selection" hidden>
+              <div class="selection-preview"><img id="local-preview" alt="待上传图片预览"></div>
+              <div class="selection-detail">
+                <h2 id="selected-file-name">-</h2>
+                <p id="selected-file-meta">-</p>
+                <div class="button-row">
+                  <button id="cancel-file" class="secondary-button" type="button">重新选择</button>
+                  <button id="upload-button" class="primary-button" type="button">上传并解析</button>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <aside class="library-panel">
+            <header><h2>附件库</h2><span id="attachment-count">0</span></header>
+            <div id="library-list" class="library-list"><p class="empty-copy">暂无附件</p></div>
+          </aside>
+        </div>
+      </section>
+
+      <!-- ---------- 证据审核 ---------- -->
+      <section id="review-view" class="view" data-view-panel="review" hidden>
+        <div id="review-empty" class="review-empty">
+          <h2>尚未选择附件</h2>
+          <p>从附件上传页或左侧最近附件中选择一份凭证。</p>
+          <button class="primary-button" type="button" data-switch="upload">前往上传</button>
+        </div>
+
+        <div id="review-workspace" class="review-grid" hidden>
+          <section class="document-pane">
+            <header class="pane-header">
+              <h2 id="document-title">原始凭证</h2>
+              <div class="image-tools">
+                <button id="zoom-out" type="button" title="缩小">−</button><span id="zoom-value">100%</span>
+                <button id="zoom-in" type="button" title="放大">＋</button><button id="zoom-reset" type="button">重置</button>
+              </div>
+            </header>
+            <div class="image-stage">
+              <div id="image-frame" class="image-frame">
+                <img id="document-image" alt="上传的旅行凭证">
+                <div id="evidence-box" class="evidence-box" hidden></div>
+              </div>
+              <div id="image-loading" class="image-loading">正在读取图片...</div>
+            </div>
+            <footer class="attachment-meta">
+              <div><span>文件</span><strong id="meta-filename">-</strong></div>
+              <div><span>尺寸</span><strong id="meta-dimensions">-</strong></div>
+              <div><span>附件 ID</span><code id="meta-id">-</code></div>
+            </footer>
+          </section>
+
+          <section class="review-pane">
+            <header class="pane-header">
+              <h2>字段审核</h2>
+              <span id="document-status" class="status-badge neutral">等待解析</span>
+            </header>
+            <div class="summary-strip">
+              <div><span>文档类型</span><strong id="document-type">-</strong></div>
+              <div><span>字段</span><strong id="field-count">0</strong></div>
+              <div><span>待确认</span><strong id="review-count">0</strong></div>
+            </div>
+            <div class="tabs">
+              <button id="fields-tab" class="tab active" type="button">结构化字段</button>
+              <button id="raw-tab" class="tab" type="button">识别原文</button>
+            </div>
+            <div id="fields-panel" class="fields-panel">
+              <div id="processing-state" class="processing-state" hidden><span class="spinner"></span><strong>正在解析图片</strong><p>读取文字、版面和字段证据</p></div>
+              <div id="fields-list" class="fields-list"></div>
+            </div>
+            <div id="raw-panel" class="raw-panel" hidden><div>原文置信度 <strong id="raw-confidence">-</strong></div><pre id="raw-text">暂无识别文本</pre></div>
+            <footer class="review-actions">
+              <span id="save-hint">选择字段可定位证据</span>
+              <div><button id="rerun-button" class="secondary-button" type="button">重新解析</button><button id="save-button" class="primary-button" type="button" disabled>保存纠错并询问</button></div>
+            </footer>
+          </section>
+        </div>
+      </section>
+
+      <!-- ---------- 长期记忆 ---------- -->
+      <section id="memory-view" class="view" data-view-panel="memory" hidden>
+        <div class="memory-layout">
+          <header class="memory-toolbar">
+            <div>
+              <p class="section-label">USER MEMORY</p>
+              <h2>长期记忆</h2>
+              <p>查看和管理 Agent 从历史会话中提取的用户信息、偏好与约束。</p>
+            </div>
+            <div class="button-row">
+              <button id="refresh-memories" class="secondary-button" type="button">刷新</button>
+              <button id="export-memories" class="primary-button" type="button">导出 JSON</button>
+            </div>
+          </header>
+          <div class="memory-summary">
+            <div><span>条目</span><strong id="memory-count">0</strong></div>
+            <div><span>全局</span><strong id="memory-global-count">0</strong></div>
+            <div><span>行程级</span><strong id="memory-trip-count">0</strong></div>
+            <div><span>会话级</span><strong id="memory-thread-count">0</strong></div>
+          </div>
+          <div id="memory-list" class="memory-list">
+            <p class="empty-copy">暂无长期记忆</p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+  <script src="/static/workspace.js?v=20260922-auth-2"></script>
+</body>
+</html>
