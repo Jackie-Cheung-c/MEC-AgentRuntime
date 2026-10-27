@@ -7,7 +7,10 @@ from uuid import UUID
 from langchain.tools import ToolRuntime, tool
 
 from src.domain import Location, Money, ReplanRequest, TravelEvent, TravelItem
-from src.planning.planning_chain import ItineraryPlanningService
+from src.travel.planning import ItineraryPlanningService
+
+from src.domain import StateMutation
+from src.travel.contracts import TravelStateOperation
 from src.tools.idempotency import build_idempotency_key
 
 
@@ -49,15 +52,16 @@ def build_planning_tools(planner: ItineraryPlanningService) -> list[Any]:
             items=[TravelItem.model_validate(item) for item in items],
             idempotency_key=idempotency_key,
         )
-        return json.dumps(
-            {
-                "operation": "trip_created",
-                "trip_id": str(result.trip_state.trip_id),
-                "version": result.trip_state.version,
-                "conflicts": [item.model_dump(mode="json") for item in result.conflicts],
+        return StateMutation(
+            adapter="travel-planning",
+            operation=TravelStateOperation.STATE_CREATED.value,
+            state_id=result.trip_state.trip_id,
+            version=result.trip_state.version,
+            data={
+                "trip_id":str(result.trip_state.trip_id),
+                "conflicts":[item.model_dump(mode="json") for item in result.conflicts]
             },
-            ensure_ascii=False,
-        )
+        ).model_dump_json
 
     @tool
     def propose_trip_replan(
@@ -100,25 +104,23 @@ def build_planning_tools(planner: ItineraryPlanningService) -> list[Any]:
             ),
             idempotency_key=idempotency_key,
         )
-        return json.dumps(
-            {
-                "operation": "replan_proposed",
-                "trip_id": trip_id,
-                "proposal_id": str(proposal.proposal_id),
+        return StateMutation(
+            adapter="travel_planning",
+            operation=TravelStateOperation.PROPOSAL_CREATED.value,
+            state_id=proposal.trip_id,
+            version=proposal.base_version,
+            reference_id=proposal.proposal_id,
+            data={
+                "trip_id":str(proposal.trip_id),
+                "proposal_id":str(proposal.proposal_id),
                 "base_version": proposal.base_version,
                 "proposed_version": proposal.proposed_state.version,
-                "item_changes": [
-                    item.model_dump(mode="json") for item in proposal.changes
-                ],
-                "trip_changes": [
-                    item.model_dump(mode="json") for item in proposal.trip_changes
-                ],
-                "conflicts": [
-                    item.model_dump(mode="json") for item in proposal.conflicts
-                ],
-            },
-            ensure_ascii=False,
-        )
+                "item_changes":[item.model_dump(mode="josn") for item in proposal.changes],
+                "trip_changes":[item.model_dump(mode="josn") for item in proposal.trip_changes],
+                "conflicts":[item.model_dump(mode="josn") for item in proposal.conflicts],  
+                }
+
+        ).model_dump_json
 
     @tool
     def confirm_trip_replan(
@@ -140,13 +142,17 @@ def build_planning_tools(planner: ItineraryPlanningService) -> list[Any]:
             UUID(proposal_id),
             idempotency_key=idempotency_key,
         )
-        return json.dumps(
-            {
-                "operation": "replan_confirmed",
-                "trip_id": trip_id,
+        return StateMutation(
+            adapter="travel_planning",
+            operation=TravelStateOperation.STATE_CONFIRMED.value,
+            state_id=state.trip_id,
+            version=state.version,
+            reference_id=UUID(proposal_id),
+            data={
+                "trip_id": str(state.trip_id),
+                "proposal_id": proposal_id,
                 "version": state.version,
             },
-            ensure_ascii=False,
-        )
+        ).model_dump_json()
 
     return [create_trip_plan, propose_trip_replan, confirm_trip_replan]

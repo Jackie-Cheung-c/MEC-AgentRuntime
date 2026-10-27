@@ -1,1 +1,1 @@
-"""HTTP API for the TravelOps application."""
+"""HTTP API for the Agent application."""

@@ -14,12 +14,14 @@ from uuid import UUID
 
 from src.memory.models import (
     MemoryCategory,
+    MemoryContext,
     MemoryItem,
     MemoryScope,
     MemoryStatus,
 )
 from src.memory.key_policy import (
     MemoryValueCardinality,
+    memory_domain_for_key,
     memory_value_cardinality,
     merge_memory_values,
 )
@@ -42,6 +44,44 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _eligible_context_sql(
+    alias: str,
+    context: MemoryContext,
+) -> tuple[str, list[Any]]:
+    """Match cross-domain memories plus current-domain scoped memories."""
+    scope_clauses = [f"{alias}.scope = ?"]
+    values: list[Any] = [
+        "general",
+        context.domain,
+        MemoryScope.GLOBAL.value,
+        context.workflow_id,
+        MemoryScope.GLOBAL.value,
+    ]
+    if context.scope_id is not None:
+        scope_clauses.append(
+            f"({alias}.scope = ? AND {alias}.scope_id = ?)"
+        )
+        values.extend([MemoryScope.CONTEXT.value, context.scope_id])
+    if context.thread_id is not None:
+        scope_clauses.append(
+            f"({alias}.scope = ? AND {alias}.thread_id = ?)"
+        )
+        values.extend([MemoryScope.THREAD.value, context.thread_id])
+
+    domain_clause = (
+        f"({alias}.domain = ? OR ("
+        f"{alias}.domain = ? AND ("
+        f"{alias}.scope = ? "
+        f"OR {alias}.workflow_id IS NULL "
+        f"OR {alias}.workflow_id = ?"
+        f")))"
+    )
+    return (
+        "(" + domain_clause + " AND (" + " OR ".join(scope_clauses) + "))",
+        values,
+    )
+
+
 class SQLiteMemoryRepository:
     """持久化并管理长期记忆，不与检索耦合
     SQLite 仍是规范存储。
@@ -56,6 +96,7 @@ class SQLiteMemoryRepository:
     ) -> None:
         self.path = Path(path)
         self.vector_index = vector_index
+        self._vector_rebuild_required = False
         self._initialize()
         self._reconcile_vector_index()
 
@@ -89,6 +130,9 @@ class SQLiteMemoryRepository:
                     memory_key TEXT NOT NULL,
                     value_json TEXT NOT NULL,
                     scope TEXT NOT NULL,
+                    domain TEXT NOT NULL DEFAULT 'general',
+                    workflow_id TEXT,
+                    scope_id TEXT,
                     trip_id TEXT,
                     thread_id TEXT,
                     confidence REAL NOT NULL,
@@ -107,33 +151,12 @@ class SQLiteMemoryRepository:
                 CREATE INDEX IF NOT EXISTS idx_memory_user_status_updated
                     ON memory_items(user_id, status, updated_at DESC);
 
-                CREATE INDEX IF NOT EXISTS idx_memory_user_scope
-                    ON memory_items(user_id, scope, trip_id, thread_id);
-
                 CREATE INDEX IF NOT EXISTS idx_memory_user_key
                     ON memory_items(user_id, category, memory_key, updated_at DESC);
 
                 DROP INDEX IF EXISTS idx_memory_active_profile_key;
-
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_active_single_key
-                    ON memory_items(
-                        user_id,
-                        category,
-                        memory_key,
-                        scope,
-                        COALESCE(trip_id, ''),
-                        COALESCE(thread_id, '')
-                    )
-                    WHERE status = 'active'
-                      AND memory_key IN (
-                          'name',
-                          'home_city',
-                          'preferred_departure_city',
-                          'preferred_transport',
-                          'preferred_hotel_level',
-                          'seat_preference',
-                          'travel_pace'
-                      );
+                DROP INDEX IF EXISTS idx_memory_active_single_key;
+                DROP INDEX IF EXISTS idx_memory_user_scope;
                 
                 -- fts5全文检索表
                 CREATE VIRTUAL TABLE IF NOT EXISTS memory_items_fts
@@ -154,6 +177,114 @@ class SQLiteMemoryRepository:
                     ON memory_extraction_state(user_id, thread_id);
                 """
             )
+            columns = {
+                row["name"]
+                for row in connection.execute(
+                    "PRAGMA table_info(memory_items)"
+                ).fetchall()
+            }
+            legacy_domain_backfill = "domain" not in columns
+            additions = {
+                "domain": (
+                    "ALTER TABLE memory_items ADD COLUMN "
+                    "domain TEXT NOT NULL DEFAULT 'general'"
+                ),
+                "workflow_id": (
+                    "ALTER TABLE memory_items ADD COLUMN workflow_id TEXT"
+                ),
+                "scope_id": (
+                    "ALTER TABLE memory_items ADD COLUMN scope_id TEXT"
+                ),
+            }
+            for column, statement in additions.items():
+                if column not in columns:
+                    connection.execute(statement)
+                    self._vector_rebuild_required = True
+
+            connection.execute(
+                """
+                UPDATE memory_items
+                SET scope_id = trip_id
+                WHERE scope_id IS NULL AND trip_id IS NOT NULL
+                """
+            )
+            connection.execute(
+                """
+                UPDATE memory_items
+                SET scope = 'context'
+                WHERE scope = 'trip'
+                """
+            )
+            connection.execute(
+                """
+                UPDATE memory_items
+                SET workflow_id = NULL
+                WHERE scope = 'global'
+                """
+            )
+
+            if legacy_domain_backfill:
+                rows = connection.execute(
+                    "SELECT memory_id, memory_key, domain, workflow_id, scope "
+                    "FROM memory_items"
+                ).fetchall()
+                for row in rows:
+                    domain = (
+                        memory_domain_for_key(row["memory_key"])
+                        or "travel"
+                    )
+                    workflow_id = (
+                        "travel_planning"
+                        if (
+                            domain == "travel"
+                            and row["scope"] != MemoryScope.GLOBAL.value
+                        )
+                        else row["workflow_id"]
+                    )
+                    connection.execute(
+                        """
+                        UPDATE memory_items
+                        SET domain = ?, workflow_id = ?
+                        WHERE memory_id = ?
+                        """,
+                        (domain, workflow_id, row["memory_id"]),
+                    )
+
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_user_scope
+                ON memory_items(
+                    user_id, domain, workflow_id, scope, scope_id, thread_id
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_active_single_key
+                ON memory_items(
+                    user_id,
+                    category,
+                    memory_key,
+                    domain,
+                    COALESCE(workflow_id, ''),
+                    scope,
+                    COALESCE(scope_id, ''),
+                    COALESCE(thread_id, '')
+                )
+                WHERE status = 'active'
+                  AND memory_key IN (
+                      'name',
+                      'language',
+                      'timezone',
+                      'home_city',
+                      'preferred_departure_city',
+                      'preferred_transport',
+                      'preferred_hotel_level',
+                      'seat_preference',
+                      'travel_pace'
+                  )
+                """
+            )
             self._rebuild_fts(connection)
 
     def _rebuild_fts(self, connection: sqlite3.Connection) -> None:
@@ -165,6 +296,10 @@ class SQLiteMemoryRepository:
         if self.vector_index is None or not hasattr(self.vector_index, "count"):
             return
         try:
+            if self._vector_rebuild_required:
+                self.rebuild_vector_index()
+                self._vector_rebuild_required = False
+                return
             with self._connect() as connection:
                 now = _utc_now().astimezone(timezone.utc).isoformat()
                 sqlite_count = int(
@@ -213,8 +348,10 @@ class SQLiteMemoryRepository:
                 WHERE user_id = ?
                   AND category = ?
                   AND memory_key = ?
+                  AND domain = ?
+                  AND COALESCE(workflow_id, '') = COALESCE(?, '')
                   AND scope = ?
-                  AND COALESCE(trip_id, '') = COALESCE(?, '')
+                  AND COALESCE(scope_id, '') = COALESCE(?, '')
                   AND COALESCE(thread_id, '') = COALESCE(?, '')
                   AND status = ?
                 LIMIT 1
@@ -223,8 +360,10 @@ class SQLiteMemoryRepository:
                     item.user_id,
                     item.category.value,
                     item.memory_key,
+                    item.domain,
+                    item.workflow_id,
                     item.scope.value,
-                    str(item.trip_id) if item.trip_id else None,
+                    item.scope_id,
                     item.thread_id,
                     MemoryStatus.ACTIVE.value,
                 ),
@@ -381,6 +520,9 @@ class SQLiteMemoryRepository:
         *,
         categories: Iterable[MemoryCategory] | None = None,
         scopes: Iterable[MemoryScope] | None = None,
+        domain: str | None = None,
+        workflow_id: str | None = None,
+        scope_id: str | None = None,
         trip_id: UUID | str | None = None,
         thread_id: str | None = None,
         limit: int = 100,
@@ -410,15 +552,28 @@ class SQLiteMemoryRepository:
             clauses.append(f"category IN ({placeholders})")
             values.extend(category_values)
 
-        scope_values = [item.value for item in scopes or ()]
+        scope_values = [
+            (
+                MemoryScope.CONTEXT.value
+                if item == MemoryScope.TRIP
+                else item.value
+            )
+            for item in scopes or ()
+        ]
         if scope_values:
             placeholders = ", ".join("?" for _ in scope_values)
             clauses.append(f"scope IN ({placeholders})")
             values.extend(scope_values)
 
-        if trip_id is not None:
-            clauses.append("trip_id = ?")
-            values.append(str(trip_id))
+        if domain is not None:
+            clauses.append("domain = ?")
+            values.append(domain)
+        if workflow_id is not None:
+            clauses.append("workflow_id = ?")
+            values.append(workflow_id)
+        if scope_id is not None or trip_id is not None:
+            clauses.append("scope_id = ?")
+            values.append(str(scope_id or trip_id))
         if thread_id is not None:
             clauses.append("thread_id = ?")
             values.append(thread_id)
@@ -430,6 +585,52 @@ class SQLiteMemoryRepository:
                 SELECT * FROM memory_items
                 WHERE {" AND ".join(clauses)}
                 ORDER BY updated_at DESC
+                LIMIT ?
+                """,
+                values,
+            ).fetchall()
+        return [self._row_to_memory(row) for row in rows]
+
+    def list_eligible(
+        self,
+        user_id: str,
+        *,
+        context: MemoryContext,
+        categories: Iterable[MemoryCategory] | None = None,
+        limit: int = 200,
+        now: datetime | None = None,
+    ) -> list[MemoryItem]:
+        """List memories eligible for one domain/workflow/scope context."""
+        if limit < 1:
+            return []
+        moment = (now or _utc_now()).astimezone(timezone.utc).isoformat()
+        context_sql, context_values = _eligible_context_sql("m", context)
+        clauses = [
+            "m.user_id = ?",
+            "m.status = ?",
+            "m.valid_from <= ?",
+            "(m.expires_at IS NULL OR m.expires_at > ?)",
+            context_sql,
+        ]
+        values: list[Any] = [
+            user_id,
+            MemoryStatus.ACTIVE.value,
+            moment,
+            moment,
+            *context_values,
+        ]
+        category_values = [item.value for item in categories or ()]
+        if category_values:
+            placeholders = ", ".join("?" for _ in category_values)
+            clauses.append(f"m.category IN ({placeholders})")
+            values.extend(category_values)
+        values.append(limit)
+        with self._connect() as connection:
+            rows = connection.execute(
+                f"""
+                SELECT m.* FROM memory_items AS m
+                WHERE {" AND ".join(clauses)}
+                ORDER BY m.updated_at DESC
                 LIMIT ?
                 """,
                 values,
@@ -472,7 +673,8 @@ class SQLiteMemoryRepository:
         with self._connect(immediate=True) as connection:
             row = connection.execute(
                 """
-                SELECT status, category, memory_key, scope, trip_id, thread_id
+                SELECT status, category, memory_key, domain, workflow_id,
+                       scope, scope_id, thread_id
                 FROM memory_items
                 WHERE memory_id = ? AND user_id = ?
                 """,
@@ -490,15 +692,19 @@ class SQLiteMemoryRepository:
             identity = (
                 row["category"],
                 row["memory_key"],
+                row["domain"],
+                row["workflow_id"],
                 row["scope"],
-                row["trip_id"],
+                row["scope_id"],
                 row["thread_id"],
             )
             replacement_identity = (
                 replacement.category.value,
                 replacement.memory_key,
+                replacement.domain,
+                replacement.workflow_id,
                 replacement.scope.value,
-                str(replacement.trip_id) if replacement.trip_id else None,
+                replacement.scope_id,
                 replacement.thread_id,
             )
             if identity != replacement_identity:
@@ -613,9 +819,22 @@ class SQLiteMemoryRepository:
         category: MemoryCategory,
         memory_key: str,
         scope: MemoryScope,
+        domain: str = "general",
+        workflow_id: str | None = None,
+        scope_id: str | None = None,
         trip_id: UUID | str | None = None,
         thread_id: str | None = None,
     ) -> MemoryItem | None:
+        scope = (
+            MemoryScope.CONTEXT
+            if scope == MemoryScope.TRIP
+            else scope
+        )
+        canonical_scope_id = (
+            str(scope_id)
+            if scope_id is not None
+            else str(trip_id) if trip_id is not None else None
+        )
         with self._connect() as connection:
             row = connection.execute(
                 """
@@ -623,8 +842,10 @@ class SQLiteMemoryRepository:
                 WHERE user_id = ?
                   AND category = ?
                   AND memory_key = ?
+                  AND domain = ?
+                  AND COALESCE(workflow_id, '') = COALESCE(?, '')
                   AND scope = ?
-                  AND COALESCE(trip_id, '') = COALESCE(?, '')
+                  AND COALESCE(scope_id, '') = COALESCE(?, '')
                   AND COALESCE(thread_id, '') = COALESCE(?, '')
                   AND status = ?
                 LIMIT 1
@@ -633,8 +854,10 @@ class SQLiteMemoryRepository:
                     user_id,
                     category.value,
                     memory_key,
+                    domain,
+                    workflow_id,
                     scope.value,
-                    str(trip_id) if trip_id else None,
+                    canonical_scope_id,
                     thread_id,
                     MemoryStatus.ACTIVE.value,
                 ),
@@ -670,6 +893,9 @@ class SQLiteMemoryRepository:
         status: MemoryStatus | None = MemoryStatus.ACTIVE,
         category: MemoryCategory | None = None,
         scope: MemoryScope | None = None,
+        domain: str | None = None,
+        workflow_id: str | None = None,
+        scope_id: str | None = None,
         limit: int = 200,
         offset: int = 0,
     ) -> list[MemoryItem]:
@@ -696,8 +922,19 @@ class SQLiteMemoryRepository:
             clauses.append("category = ?")
             values.append(category.value)
         if scope is not None:
+            if scope == MemoryScope.TRIP:
+                scope = MemoryScope.CONTEXT
             clauses.append("scope = ?")
             values.append(scope.value)
+        if domain is not None:
+            clauses.append("domain = ?")
+            values.append(domain)
+        if workflow_id is not None:
+            clauses.append("workflow_id = ?")
+            values.append(workflow_id)
+        if scope_id is not None:
+            clauses.append("scope_id = ?")
+            values.append(scope_id)
         values.extend([limit, offset])
         with self._connect() as connection:
             where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
@@ -717,7 +954,7 @@ class SQLiteMemoryRepository:
         user_id: str,
         query: str,
         *,
-        trip_id: UUID | str | None = None,
+        context: MemoryContext,
         limit: int = 20,
         now: datetime | None = None,
     ) -> list[tuple[str, float]]:
@@ -725,17 +962,7 @@ class SQLiteMemoryRepository:
         if not match_query or limit < 1:
             return []
         moment = (now or _utc_now()).astimezone(timezone.utc).isoformat()
-        scope_clause = "m.scope = ?"
-        scope_values: list[Any] = [MemoryScope.GLOBAL.value]
-        if trip_id is not None:
-            scope_clause = (
-                "(m.scope = ? OR (m.scope = ? AND m.trip_id = ?))"
-            )
-            scope_values = [
-                MemoryScope.GLOBAL.value,
-                MemoryScope.TRIP.value,
-                str(trip_id),
-            ]
+        context_sql, context_values = _eligible_context_sql("m", context)
         with self._connect() as connection:
             rows = connection.execute(
                 f"""
@@ -748,7 +975,7 @@ class SQLiteMemoryRepository:
                   AND m.status = ?
                   AND m.valid_from <= ?
                   AND (m.expires_at IS NULL OR m.expires_at > ?)
-                  AND {scope_clause}
+                  AND {context_sql}
                 ORDER BY rank
                 LIMIT ?
                 """,
@@ -758,7 +985,7 @@ class SQLiteMemoryRepository:
                     MemoryStatus.ACTIVE.value,
                     moment,
                     moment,
-                    *scope_values,
+                    *context_values,
                     limit,
                 ),
             ).fetchall()
@@ -864,6 +1091,9 @@ class SQLiteMemoryRepository:
                 " ".join(
                     (
                         item.category.value,
+                        item.domain,
+                        item.workflow_id or "",
+                        item.scope.value,
                         item.memory_key,
                         json.dumps(item.value, ensure_ascii=False, default=str),
                         item.evidence_quote or "",
@@ -882,10 +1112,13 @@ class SQLiteMemoryRepository:
             """
             INSERT INTO memory_items (
                 memory_id, user_id, category, memory_key, value_json, scope,
-                trip_id, thread_id, confidence, source_type, source_ref,
-                evidence_quote, status, supersedes_id, valid_from, expires_at,
-                created_at, updated_at, metadata_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                domain, workflow_id, scope_id, trip_id, thread_id, confidence,
+                source_type, source_ref, evidence_quote, status, supersedes_id,
+                valid_from, expires_at, created_at, updated_at, metadata_json
+            ) VALUES (
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                ?, ?
+            )
             """,
             (
                 str(item.memory_id),
@@ -894,6 +1127,9 @@ class SQLiteMemoryRepository:
                 item.memory_key,
                 json.dumps(item.value, ensure_ascii=False, default=str),
                 item.scope.value,
+                item.domain,
+                item.workflow_id,
+                item.scope_id,
                 str(item.trip_id) if item.trip_id else None,
                 item.thread_id,
                 item.confidence,
@@ -920,6 +1156,9 @@ class SQLiteMemoryRepository:
                 "memory_key": row["memory_key"],
                 "value": json.loads(row["value_json"]),
                 "scope": row["scope"],
+                "domain": row["domain"],
+                "workflow_id": row["workflow_id"],
+                "scope_id": row["scope_id"] or row["trip_id"],
                 "trip_id": row["trip_id"],
                 "thread_id": row["thread_id"],
                 "confidence": row["confidence"],

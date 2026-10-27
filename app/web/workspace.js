@@ -10,15 +10,15 @@ const state = {
   user: null, authMode: 'login',
   initialized: false, protectedImageUrl: null,
   pendingRequest: null, pendingUi: null,
+  capabilities: null, documentTypes: new Map(), capabilityRequestId: 0,
 };
 
 const viewMeta = {
-  chat: ['TRAVELOPS AGENT', '智能对话'],
+  chat: ['AGENT WORKSPACE', '智能对话'],
   upload: ['ATTACHMENT INTAKE', '附件上传'],
   review: ['HUMAN IN THE LOOP', '证据审核'],
   memory: ['USER MEMORY', '长期记忆'],
 };
-const documentTypes = { flight_ticket: '机票', train_ticket: '火车票', hotel_booking: '酒店订单', attraction_booking: '景点订单', cancellation_notice: '取消通知', delay_notice: '延误通知', receipt: '收据', map: '地图', menu: '菜单', sign: '标识', other: '其他' };
 const statusLabels = { pending: '等待解析', completed: '已完成', needs_review: '待人工确认', failed: '解析失败' };
 const THREAD_STORAGE_PREFIX = 'travelops.active_thread_id.';
 const AUTH_TOKEN_STORAGE_KEY = 'travelops.auth_token';
@@ -67,6 +67,87 @@ function responseErrorMessage(data, status) {
   if (typeof detail === 'string' && detail.trim()) return detail;
   if (typeof data?.error === 'string' && data.error.trim()) return data.error;
   return `请求失败 (${status})`;
+}
+function documentTypeLabel(documentType) {
+  return state.documentTypes.get(documentType) || documentType;
+}
+function setChatPrompt(prompt) {
+  if (!prompt) return;
+  byId('chat-input').value = prompt;
+  byId('chat-input').focus();
+}
+function renderQuickPrompts(prompts) {
+  const grid = byId('quick-prompt-grid');
+  grid.replaceChildren();
+  grid.hidden = !prompts.length;
+  prompts.forEach((item) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    const title = document.createElement('strong');
+    title.textContent = item.title;
+    const description = document.createElement('small');
+    description.textContent = item.description || '';
+    button.append(title);
+    if (description.textContent) button.append(description);
+    button.addEventListener('click', () => setChatPrompt(item.prompt));
+    grid.append(button);
+  });
+}
+function renderToolEntries(entries) {
+  const grid = byId('tool-entry-grid');
+  grid.replaceChildren();
+  grid.hidden = !entries.length;
+  entries.forEach((item) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'tool-entry';
+    button.disabled = item.available === false;
+    if (item.unavailable_reason) {
+      button.title = item.unavailable_reason;
+    }
+    const title = document.createElement('strong');
+    title.textContent = item.title;
+    const description = document.createElement('small');
+    description.textContent = item.description || '';
+    button.append(title);
+    if (description.textContent) button.append(description);
+    button.addEventListener('click', () => setChatPrompt(item.prompt));
+    grid.append(button);
+  });
+}
+function renderDocumentTypeHint(documentTypes) {
+  const labels = Array.from(
+    new Set(
+      documentTypes
+        .map((item) => item.label || item.id)
+        .filter(Boolean),
+    ),
+  );
+  byId('upload-document-types').textContent = labels.length
+    ? `支持：${labels.join('、')}`
+    : '将文档拖到这里';
+}
+function applyCapabilities(payload) {
+  state.capabilities = payload || {};
+  state.documentTypes = new Map(
+    (payload?.document_types || []).map(
+      (item) => [item.id, item.label || item.id],
+    ),
+  );
+  renderQuickPrompts(payload?.quick_prompts || []);
+  renderToolEntries(payload?.tool_entries || []);
+  renderDocumentTypeHint(payload?.document_types || []);
+}
+async function loadCapabilities() {
+  const requestId = ++state.capabilityRequestId;
+  try {
+    const payload = await api('/api/capabilities');
+    if (requestId !== state.capabilityRequestId) return;
+    applyCapabilities(payload);
+  } catch (error) {
+    if (requestId !== state.capabilityRequestId) return;
+    showMessage(`能力元数据加载失败：${error.message}`, true);
+  }
 }
 function parseSseFrame(frame) {
   const message = { event: 'message', data: [] };
@@ -121,6 +202,7 @@ async function streamAgent(payload, onDelta, onReset) {
       result = data.result;
     } else if (message.event === 'error') {
       streamError = new Error(data.error || data.detail || '流式请求失败。');
+      streamError.terminal = data.terminal !== false;
     }
   };
 
@@ -443,7 +525,7 @@ function typedValue(input, original) { const value = input.value; if (original =
 function renderExtraction(record) {
   state.extraction = record; state.evidenceById = new Map(record.evidence.map((item) => [item.evidence_id, item])); state.originalValues.clear(); state.dirtyPaths.clear();
   const doc = record.document, reviewCount = doc.fields.filter((field) => field.requires_confirmation).length;
-  byId('document-type').textContent = documentTypes[doc.document_type] || doc.document_type; byId('field-count').textContent = String(doc.fields.length); byId('review-count').textContent = String(reviewCount); byId('raw-text').textContent = doc.raw_text || '暂无识别文本';
+  byId('document-type').textContent = documentTypeLabel(doc.document_type); byId('field-count').textContent = String(doc.fields.length); byId('review-count').textContent = String(reviewCount); byId('raw-text').textContent = doc.raw_text || '暂无识别文本';
   const raw = record.evidence.find((item) => item.metadata?.kind === 'vlm_transcription'); byId('raw-confidence').textContent = raw ? `${Math.round(raw.confidence * 100)}%` : '-'; setDocumentStatus(doc.status);
   const list = byId('fields-list'); list.hidden = false; list.replaceChildren(); if (!doc.fields.length) list.innerHTML = '<p class="no-fields">没有提取到可验证字段</p>';
   doc.fields.forEach((field) => {
@@ -572,7 +654,7 @@ function renderMemoryList() {
     memories.filter((item) => item.scope === 'global').length
   );
   byId('memory-trip-count').textContent = String(
-    memories.filter((item) => item.scope === 'trip').length
+    memories.filter((item) => item.scope === 'context').length
   );
   byId('memory-thread-count').textContent = String(
     memories.filter((item) => item.scope === 'thread').length
@@ -605,8 +687,10 @@ function renderMemoryList() {
     const meta = document.createElement('div');
     meta.className = 'memory-meta';
     meta.textContent = [
+      memory.domain || 'general',
       memory.scope,
-      memory.trip_id ? `trip ${memory.trip_id.slice(0, 8)}` : '',
+      memory.workflow_id || '',
+      memory.scope_id ? `scope ${memory.scope_id.slice(0, 8)}` : '',
       memory.thread_id ? `thread ${memory.thread_id.slice(0, 8)}` : '',
       `置信度 ${Math.round((memory.confidence || 0) * 100)}%`,
       formatMemoryTime(memory.updated_at),
@@ -832,6 +916,7 @@ function loadPendingRequest() {
   }
 }
 function isRetryableRequestError(error) {
+  if (error?.terminal) return false;
   if (!navigator.onLine) return true;
   const status = Number(error?.status || 0);
   return !status || status >= 500 || status === 408 || status === 429;
@@ -882,7 +967,11 @@ async function executePendingRequest(pending, options = {}) {
       },
     );
     if (result.thread_id) state.threadId = result.thread_id;
-    if (result.trip_state) state.trip = result.trip_state;
+    if (result.state?.adapter === 'travel_planning') {
+        state.trip = result.state.payload;
+      } else if (result.trip_state) {
+        state.trip = result.trip_state;
+      }
     rememberActiveThread(state.threadId);
     assistant.message.classList.remove('pending', 'streaming');
     assistant.body.textContent =
@@ -971,6 +1060,7 @@ function newChat() {
     showMessage('请等待当前回答完成后再新建会话。', true);
     return;
   }
+  clearPendingRequest();
   state.threadOpenRequestId += 1;
   state.threadId = crypto.randomUUID();
   state.trip = null;
@@ -990,14 +1080,13 @@ function initializeApp() {
   state.threadId = crypto.randomUUID();
   state.trip = null;
   setZoom(100);
-  Promise.allSettled([loadAttachments(), loadThreads()]).then(() => {
+  Promise.allSettled([loadCapabilities(), loadAttachments(), loadThreads()]).then(() => {
     restorePendingRequest();
   });
 }
 
 document.querySelectorAll('.nav-item').forEach((item) => item.addEventListener('click', () => switchView(item.dataset.view)));
 document.querySelectorAll('[data-switch]').forEach((item) => item.addEventListener('click', () => switchView(item.dataset.switch)));
-document.querySelectorAll('[data-prompt]').forEach((item) => item.addEventListener('click', () => { byId('chat-input').value = item.dataset.prompt; byId('chat-input').focus(); }));
 byId('new-chat').addEventListener('click', newChat); byId('refresh-list').addEventListener('click', loadAttachments); byId('clear-attachment').addEventListener('click', () => setActiveAttachment(null));
 byId('refresh-threads').addEventListener('click', loadThreads);
 byId('refresh-memories').addEventListener('click', loadMemories);

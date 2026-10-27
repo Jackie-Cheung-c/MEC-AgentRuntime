@@ -1,58 +1,43 @@
-# TravelOps
+# MEC-AgentRuntime
 
-TravelOps 是具备持久化执行、幂等、证据链、审计轨迹的旅游 Agent 基础平台。 
-以多模态证据链、全链路可审计、4层可恢复执行等为核心，覆盖对话、工具调用、Skill、双层记忆、行程规划与重规划、质量审查、执行轨迹与持久化任务队列，实现Agent 服务的任务崩溃后的恢复与续跑、副作用工具的重试幂、附件内容的证据可审计等。
+MEC-AgentRuntime 是一个面向通用任务的可恢复、可审计、可扩展 Agent 运行时。
 
+它将对话编排、工具调用、Skill、业务状态、双层记忆、附件证据、质量审查和持久化任务队列统一在同一条执行链路中。平台核心不绑定具体行业，可用于客服支持、办公自动化、知识工作、业务办理、研究分析等需要多轮交互和外部工具的任务。
 ## 项目结构
-
-```text
+```
 app/
-├── api/                    # FastAPI 接口
-├── web/                    # 用户工作台静态资源
-└── cli.py                  # 本地交互入口
-scripts/                    # 数据检查和维护脚本
+├── api/                    # FastAPI 入口、认证、能力目录和领域路由
+├── web/                    # Agent 工作台静态资源
+├── cli.py                  # 本地交互入口
+└── worker.py               # 持久化任务 worker 入口
+
+config/
+└── settings.py             # 环境变量与运行配置
+
 src/
-├── agent/                  # 唯一的 TravelOps Agent 编排
-├── auth/                   # 账号、密码哈希与 Token 校验
-├── attachments/            # 图片上传、解析与证据提取
-├── domain/                 # 附件、证据、行程状态和统一运行契约
-├── planning/               # 行程规划与重规划
-├── tools/                  # 天气、地图、费用和 MCP 工具
-├── policies/               # 规则与模型辅助质量检查
-├── tracing/                # 执行轨迹
-├── storage/                # SQLite 生产存储与可自动清理的测试存储
-├── evals/                  # 数据集、断言和故障注入
-├── memory/                 # 跨会话长期记忆、FTS5 与 Chroma 索引
-├── session_memory/         # 当前 user_id + thread_id 的持久化会话记忆
-├── prompts/                # Prompt 资源
-└── skills/                 # Agent Skill 资源
+├── agent/                  # 通用编排、依赖组装、状态注入和工具选择
+├── attachments/            # 上传、VLM 提取与证据构建
+├── auth/                   # 注册、登录、密码哈希与 Bearer Token
+├── domain/                 # 请求、结果、轨迹、证据和状态契约
+├── memory/                 # 长期记忆、FTS5 与 Chroma 向量索引
+├── policies/               # 回答质量审查与重试策略
+├── prompts/                # 系统提示词与领域 Prompt 资源
+├── session_memory/         # 会话记忆、混合检索与上下文压缩
+├── skills/                 # Skill 发现、加载和 UI 能力元数据
+├── state_adapters/         # 业务状态读写适配器
+├── storage/                # SQLite 仓储、任务队列和 MinIO 对象存储
+├── tools/                  # 工具注册、MCP 与内置工具实现
+├── tracing/                # LangChain 执行轨迹采集
+├── travel/                 # 内置旅行领域示例
+└── worker.py               # 任务领取、重试和恢复逻辑
+
+data/                       # 默认 SQLite 与运行数据目录
 ```
 
 ## 统一入口位置：
 
 - HTTP：`app/api/main.py`
 - CLI：`app/cli.py`
-
-## 运行
-
-安装依赖并配置所需环境变量后，在仓库根目录运行：
-
-```powershell
-python -m app.cli
-```
-
-启动 Web 工作台：
-
-```powershell
-uvicorn app.api.main:app --reload
-```
-
-启动独立 Agent worker（建议至少与 Web 服务分开一个进程运行）：
-
-```powershell
-python -m app.worker
-```
-默认地址为 `http://127.0.0.1:8000`
 
 
 ## 注册示例：
@@ -78,3 +63,61 @@ AUTH_TOKEN_TTL_SECONDS=604800
 AUTH_ISSUER=travelops
 AUTH_REQUIRED=true
 ```
+## 至少配置
+```dotenv
+DEEPSEEK_API_KEY=<model-api-key>
+DEEPSEEK_BASE_URL=<openai-compatible-base-url>
+AUTH_SECRET_KEY=<random-secret>
+AUTH_REQUIRED=true
+```
+
+## 如需图片附件提取
+```dotenv
+MINIO_ENDPOINT=127.0.0.1:9000
+MINIO_ACCESS_KEY=<minio-access-key>
+MINIO_SECRET_KEY=<minio-secret-key>
+MINIO_BUCKET=<>
+MINIO_SECURE=false
+
+VLM_MODEL=<vision-model>
+VLM_BASE_URL=<vision-openai-compatible-base-url>
+VLM_API_KEY=<vision-api-key>
+```
+
+## 本地启动MinIO
+```powershell
+docker compose up -d minio
+```
+
+## 运行
+
+安装依赖并配置所需环境变量后，在仓库根目录运行：
+
+```powershell
+python -m app.cli
+```
+
+启动 Web 工作台：
+
+```powershell
+uvicorn app.api.main:app --reload
+```
+
+启动独立 Agent worker（建议至少与 Web 服务分开一个进程运行）：
+
+```powershell
+python -m app.worker
+```
+默认地址为 `http://127.0.0.1:8000`
+
+## 扩展 Agent 
+### 新增工具
+1. 在 src/tools/ 中实现 LangChain Tool。
+2. 在 src/tools/catalog.py 中注册稳定的 capability_id、标签和所需环境变量。
+3. 在目标 Skill 的 tools 元数据中声明工具名称。
+### 新增 Skill
+在 src/skills/<skill-name>/SKILL.md 中添加元数据和领域
+### 新增业务状态
+实现 src/state_adapters/base.py 中的 StateAdapter，在运行前加载业务上下文，在运行后从执行轨迹中收集状态变化、事件、产物和待确认操作，然后在 src/agent/composition.py 中注册。
+接入 MCP
+在 src/tools/mcp/servers.py 中声明 MCP Server，通过 src/tools/mcp/manager.py 延迟加载工具。缺少依赖或连接失败时，能力目录会标记该能力不可用。

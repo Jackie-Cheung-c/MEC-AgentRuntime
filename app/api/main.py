@@ -1,4 +1,4 @@
-"""FastAPI application for TravelOps."""
+"""FastAPI application for the Agent workspace."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Any
 from uuid import UUID
 
 from dotenv import load_dotenv
@@ -21,7 +21,6 @@ from fastapi import (
     FastAPI,
     File,
     Form,
-    Header,
     HTTPException,
     Query,
     Request,
@@ -30,13 +29,14 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
 
 from app.api.auth import (
     get_current_user,
     resolve_user_id,
     router as auth_router,
 )
+from app.api.capabilities import router as capabilities_router
+from app.api.travel import router as travel_router
 from config import settings
 from src.agent.service import UnsupportedAttachmentError
 from src.agent.travel_agent import close_default_checkpointer
@@ -60,11 +60,8 @@ from src.domain import (
     Attachment,
     AttachmentExtractionRecord,
     CorrectionBatch,
-    ReplanProposal,
-    ReplanRequest,
     ThreadSummary,
     ThreadTurn,
-    TripState,
 )
 from src.memory import (
     ChromaMemoryVectorIndex,
@@ -75,12 +72,12 @@ from src.memory import (
     MemoryStatus,
     SQLiteMemoryRepository,
 )
-from src.planning import (
+from src.skills.registry import (
+    get_skill,
+    resolve_skill_extraction_policy,
+)
+from src.travel import (
     ItineraryPlanningService,
-    PlanningError,
-    ProposalConflictError,
-    TripNotFoundError,
-    TripVersionConflictError,
 )
 from src.storage.attachment_store import (
     CorrectionConflictError,
@@ -89,16 +86,6 @@ from src.storage.attachment_store import (
 )
 from src.storage.trace_store import SQLiteTraceStore
 from src.storage.trip_store import SQLiteTripRepository
-from src.tools.expenses_tool import (
-    get_expense_summary_for_user,
-    record_expenses_for_user,
-)
-from src.tools.hotel_tool import search_nearby_hotels
-from src.tools.idempotency import payload_fingerprint
-from src.tools.search_tool import recommend_attractions
-from src.tools.traffic_recommand_tool import plan_route
-from src.tools.weather_tool import get_weather
-
 APP_DIR = Path(__file__).resolve().parents[1]
 STATIC_DIR = APP_DIR / "web"
 @asynccontextmanager
@@ -107,7 +94,7 @@ async def lifespan(_app: FastAPI):
     await close_default_checkpointer()
 
 
-app = FastAPI(title="TravelOps Control Room", lifespan=lifespan)
+app = FastAPI(title="TravelTrace Agent Workspace", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 app.state.auth_service = AuthService.with_defaults()
 app.state.trip_repository = SQLiteTripRepository()
@@ -119,102 +106,13 @@ app.state.trace_store = SQLiteTraceStore()
 app.state.memory_repository = None
 app.state.memory_vector_index = None
 app.include_router(auth_router)
-
-
-class DestinationRequest(BaseModel):
-    destination: str = Field(min_length=1, max_length=100)
-
-
-class RouteRequest(BaseModel):
-    origin: str = Field(min_length=1, max_length=100)
-    destination: str = Field(min_length=1, max_length=100)
-
-
-class ExpenseRequest(BaseModel):
-    expense_text: str = Field(min_length=1, max_length=500)
-
-
-class TripOwnerRequest(BaseModel):
-    user_id: str = Field(default="local_user", min_length=1, max_length=128)
+app.include_router(capabilities_router)
+app.include_router(travel_router)
 
 
 @app.get("/")
 async def home() -> FileResponse:
     return FileResponse(STATIC_DIR / "workspace.html")
-
-
-async def _call_tool(tool, payload: dict) -> dict[str, str]:
-    try:
-        result = await asyncio.to_thread(tool.invoke, payload)
-        return {"result": str(result)}
-    except Exception as error:
-        raise HTTPException(status_code=502, detail=str(error)) from error
-
-
-@app.post("/api/weather")
-async def weather(
-    request: DestinationRequest,
-    principal: CurrentUser,
-) -> dict[str, str]:
-    return await _call_tool(get_weather, {"city": request.destination})
-
-
-@app.post("/api/attractions")
-async def attractions(
-    request: DestinationRequest,
-    principal: CurrentUser,
-) -> dict[str, str]:
-    return await _call_tool(recommend_attractions, {"destination": request.destination})
-
-
-@app.post("/api/hotels")
-async def hotels(
-    request: DestinationRequest,
-    principal: CurrentUser,
-) -> dict[str, str]:
-    return await _call_tool(search_nearby_hotels, {"attraction": request.destination})
-
-
-@app.post("/api/route")
-async def route(
-    request: RouteRequest,
-    principal: CurrentUser,
-) -> dict[str, str]:
-    return await _call_tool(plan_route, request.model_dump())
-
-
-@app.post("/api/expenses")
-async def expenses(
-    request: ExpenseRequest,
-    principal: CurrentUser,
-    idempotency_key: Annotated[
-        str | None,
-        Header(alias="Idempotency-Key", min_length=1, max_length=255),
-    ] = None,
-) -> dict[str, str]:
-    effective_user_id = resolve_user_id(principal)
-    scoped_key = (
-        f"record_expenses:{effective_user_id}:{idempotency_key}:"
-        + payload_fingerprint({"expense_text": request.expense_text.strip()})
-        if idempotency_key
-        else None
-    )
-    result = await asyncio.to_thread(
-        record_expenses_for_user,
-        request.expense_text,
-        effective_user_id,
-        idempotency_key=scoped_key,
-    )
-    return {"result": str(result)}
-
-
-@app.get("/api/expenses")
-async def expense_summary(principal: CurrentUser) -> dict[str, str]:
-    result = await asyncio.to_thread(
-        get_expense_summary_for_user,
-        resolve_user_id(principal),
-    )
-    return {"result": str(result)}
 
 
 def get_trace_store(request: Request) -> SQLiteTraceStore:
@@ -239,10 +137,6 @@ def get_image_vlm_processor(request: Request) -> ImageVLMProcessor:
         return get_default_image_vlm_processor()
     except VLMConfigurationError as error:
         raise HTTPException(status_code=503, detail=str(error)) from error
-
-
-def get_planning_service(request: Request) -> ItineraryPlanningService:
-    return request.app.state.planning_service
 
 
 CurrentUser = Annotated[Principal, Depends(get_current_user)]
@@ -280,6 +174,8 @@ def _agent_result_payload(result: Any) -> dict:
                 "answer",
                 "error",
                 "trip_state",
+                "events",
+                "artifacts"
             },
             exclude_none=True,
         )
@@ -291,6 +187,8 @@ def _agent_result_payload(result: Any) -> dict:
             "answer",
             "error",
             "trip_state",
+            "events",
+            "artifacts",
         )
         if result.get(key) is not None
     }
@@ -347,95 +245,6 @@ async def _wait_for_agent_result(
             max(0.05, settings.AGENT_TASK_POLL_INTERVAL_SECONDS)
         )
 
-
-@app.get("/api/trips/{trip_id}", response_model=TripState)
-async def get_trip(
-    trip_id: UUID,
-    principal: CurrentUser,
-    planner: Annotated[ItineraryPlanningService, Depends(get_planning_service)],
-    user_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
-) -> TripState:
-    effective_user_id = resolve_user_id(principal, user_id)
-    try:
-        return await asyncio.to_thread(
-            planner.repository.get,
-            effective_user_id,
-            trip_id,
-        )
-    except TripNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.post("/api/trips/{trip_id}/replan", response_model=ReplanProposal)
-async def propose_trip_replan(
-    trip_id: UUID,
-    request: ReplanRequest,
-    principal: CurrentUser,
-    planner: Annotated[ItineraryPlanningService, Depends(get_planning_service)],
-    idempotency_key: Annotated[
-        str | None,
-        Header(alias="Idempotency-Key", min_length=1, max_length=255),
-    ] = None,
-) -> ReplanProposal:
-    secured_request = request.model_copy(
-        update={"user_id": resolve_user_id(principal, request.user_id)}
-    )
-    scoped_key = (
-        f"propose_trip_replan:{secured_request.user_id}:{idempotency_key}"
-        if idempotency_key
-        else None
-    )
-    try:
-        return await asyncio.to_thread(
-            planner.propose_replan,
-            trip_id,
-            secured_request,
-            idempotency_key=scoped_key,
-        )
-    except TripNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    except TripVersionConflictError as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
-    except PlanningError as error:
-        raise HTTPException(status_code=422, detail=str(error)) from error
-
-
-@app.post(
-    "/api/trips/{trip_id}/replan/{proposal_id}/confirm",
-    response_model=TripState,
-)
-async def confirm_trip_replan(
-    trip_id: UUID,
-    proposal_id: UUID,
-    request: TripOwnerRequest,
-    principal: CurrentUser,
-    planner: Annotated[ItineraryPlanningService, Depends(get_planning_service)],
-    idempotency_key: Annotated[
-        str | None,
-        Header(alias="Idempotency-Key", min_length=1, max_length=255),
-    ] = None,
-) -> TripState:
-    effective_user_id = resolve_user_id(principal, request.user_id)
-    scoped_key = (
-        f"confirm_trip_replan:{effective_user_id}:{idempotency_key}:"
-        + payload_fingerprint(
-            {"trip_id": str(trip_id), "proposal_id": str(proposal_id)}
-        )
-        if idempotency_key
-        else None
-    )
-    try:
-        return await asyncio.to_thread(
-            planner.confirm_replan,
-            effective_user_id,
-            trip_id,
-            proposal_id,
-            idempotency_key=scoped_key,
-        )
-    except TripNotFoundError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-    except (TripVersionConflictError, ProposalConflictError) as error:
-        raise HTTPException(status_code=409, detail=str(error)) from error
 
 # 上传附件的API端点
 @app.post(
@@ -549,6 +358,10 @@ async def extract_attachment(
     service: Annotated[AttachmentUploadService, Depends(get_attachment_service)],
     processor: Annotated[ImageVLMProcessor, Depends(get_image_vlm_processor)],
     user_id: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
+    skill_name: Annotated[
+        str | None,
+        Query(alias="skill", min_length=1, max_length=255),
+    ] = None,
     force: bool = Query(
         default=False,
         description="是否强制重新执行 VLM 提取",
@@ -558,8 +371,8 @@ async def extract_attachment(
     提取图片信息。
 
     默认行为：
-    - 已经有解析记录：直接返回数据库记录
-    - 没有解析记录：调用 VLM
+    - 当前附件已有相同 Skill/Workflow 策略的结果：复用记录
+    - 没有结果或策略不匹配：调用 VLM
 
     force=true：
     - 忽略已有解析记录
@@ -567,25 +380,21 @@ async def extract_attachment(
     """
     effective_user_id = resolve_user_id(principal, user_id)
     try:
+        selected_skill = get_skill(skill_name) if skill_name else None
+        if skill_name and selected_skill is None:
+            raise HTTPException(status_code=404, detail="Skill not found.")
+        extraction_policy = resolve_skill_extraction_policy(selected_skill)
         # 第一步：验证附件归属
         attachment = await asyncio.to_thread(
             service.get,
             user_id=effective_user_id,
             attachment_id=attachment_id,
         )
-        # 第二步：默认优先复用已有解析结果
-        if not force:
-            existing  = await asyncio.to_thread(
-                service.repository.get_latest_extraction,
-                effective_user_id,
-                attachment_id,
-            )
-            if existing  is not None:
-                return existing 
-        # 第三步：没有解析记录，或者 force=true，才调用 VLM
+        # 第二步：由处理器按策略决定是否复用已有解析结果
         documents, evidence = await processor.process(
             [attachment],
             user_id=effective_user_id,
+            policy=extraction_policy,
             force=force,
         )
         # 优先读取数据库中已有的解析记录，避免重复写入
@@ -744,6 +553,15 @@ async def list_memories(
     ] = "active",
     category: MemoryCategory | None = None,
     scope: MemoryScope | None = None,
+    domain: Annotated[
+        str | None,
+        Query(pattern=r"^[a-z][a-z0-9_-]*$", max_length=100),
+    ] = None,
+    workflow_id: Annotated[
+        str | None,
+        Query(pattern=r"^[a-z][a-z0-9_-]*$", max_length=100),
+    ] = None,
+    scope_id: Annotated[str | None, Query(min_length=1, max_length=255)] = None,
     limit: Annotated[int, Query(ge=1, le=500)] = 200,
     offset: Annotated[int, Query(ge=0)] = 0,
 ) -> list[MemoryItem]:
@@ -754,6 +572,9 @@ async def list_memories(
         status=None if status == "all" else MemoryStatus(status),
         category=category,
         scope=scope,
+        domain=domain,
+        workflow_id=workflow_id,
+        scope_id=scope_id,
         limit=limit,
         offset=offset,
     )
@@ -943,9 +764,9 @@ async def assistant_stream(
         except asyncio.CancelledError:
             raise
         except UnsupportedAttachmentError as error:
-            yield _sse("error", {"error": str(error)})
+            yield _sse("error", {"error": str(error),"terminal": True})
         except Exception as error:
-            yield _sse("error", {"error": str(error)})
+            yield _sse("error", {"error": str(error),"terminal": True})
 
     return StreamingResponse(
         event_stream(),

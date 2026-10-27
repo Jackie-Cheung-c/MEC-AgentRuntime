@@ -1,1 +1,1 @@
-"""TravelOps application entrypoints."""
+"""Application entrypoints."""

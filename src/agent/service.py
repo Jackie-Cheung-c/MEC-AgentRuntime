@@ -1,4 +1,4 @@
-"""Application service shared by the API, CLI, and offline evaluations."""
+"""Generic Agent application service shared by the API, CLI, and evals."""
 ## api、CLI 和离线评估共享的应用服务
 from __future__ import annotations
 import logging
@@ -11,7 +11,7 @@ from datetime import datetime, timezone
 from time import perf_counter
 from typing import Any, Protocol
 from uuid import UUID
-
+import re
 from config import settings
 from src.domain import (
     AgentRunRequest,
@@ -21,8 +21,7 @@ from src.domain import (
     Evidence,
     ExecutionTrace,
     ExtractedDocument,
-    TripState,
-    TravelEvent,
+    ExtractionPolicy,
     RunMetrics,
     RunStatus,
     TraceSpan,
@@ -31,7 +30,16 @@ from src.domain import (
     ToolCallRecord,
     ToolCallStatus,
 )
+from src.memory.models import MemoryContext
+
+from src.state_adapters import (
+    StateAdapter,
+    StateContext,
+    StateOutcome,
+)
+
 from src.agent.session import build_session_key
+from src.tools.catalog import load_enabled_tools
 logger = logging.getLogger(__name__)
 
 class UnsupportedAttachmentError(RuntimeError):
@@ -94,7 +102,7 @@ class SkillSelector(Protocol):
 
 
 class SkillLoader(Protocol):
-    def __call__(self, skill: dict[str, str]) -> str: ...
+    def __call__(self, skill: dict[str, Any]) -> str: ...
 
 
 class TraceRunner(Protocol):
@@ -114,8 +122,19 @@ class CriticRunner(Protocol):
 
 class AttachmentProcessor(Protocol):
     def __call__(
-        self, attachments: list[Attachment], *, user_id: str
+        self,
+        attachments: list[Attachment],
+        *,
+        user_id: str,
+        extraction_policy: ExtractionPolicy,
     ) -> Awaitable[tuple[list[ExtractedDocument], list[Evidence]]]: ...
+
+
+class ExtractionPolicyResolver(Protocol):
+    def __call__(
+        self,
+        skill: Mapping[str, Any] | None,
+    ) -> ExtractionPolicy: ...
 
 
 class ToolProvider(Protocol):
@@ -124,7 +143,7 @@ class ToolProvider(Protocol):
 
 @dataclass(slots=True)
 class ServiceDependencies:
-    """Replaceable edges around the single TravelOps Agent."""
+    """Replaceable edges around the single Agent runtime."""
 
     agent_factory: AgentFactory | None = None
     tool_provider: ToolProvider | None = None
@@ -134,6 +153,7 @@ class ServiceDependencies:
     compression_model: Any | None = None
     skill_selector: SkillSelector | None = None
     skill_loader: SkillLoader | None = None
+    extraction_policy_resolver: ExtractionPolicyResolver | None = None
     trace_runner: TraceRunner | None = None
     critic_runner: CriticRunner | None = None
     context_compressor: Callable[..., Awaitable[None]] | None = None
@@ -143,17 +163,17 @@ class ServiceDependencies:
     long_term_memory_repository: Any | None = None
     long_term_memory_vector_index: Any | None = None
     long_term_memory_retriever: (
-        Callable[[str, str, UUID | None], str] | None
+        Callable[[str, str, MemoryContext], str] | None
     ) = None
     long_term_memory_recorder: (
-        Callable[[AgentRunRequest, AgentRunResult], Any] | None
+        Callable[[AgentRunRequest, AgentRunResult, MemoryContext], Any] | None
     ) = None
     run_starter: Callable[[AgentRunRequest], Any] | None = None
     run_step_recorder: Callable[[str, TraceSpan], Any] | None = None
     trace_recorder: Callable[[AgentRunRequest, AgentRunResult], Any] | None = None
     trace_store: Any | None = None
     attachment_processor: AttachmentProcessor | None = None
-    planning_service: Any | None = None
+    state_adapters: tuple[StateAdapter, ...] = ()
     max_retries: int = 3
 
 
@@ -214,36 +234,27 @@ async def _maybe_await(value: Any) -> Any:
     return await value if inspect.isawaitable(value) else value
 
 
-class TravelOpsService:
-    """Run one business Agent with injectable model, tool, and storage edges."""
+class AgentService:
+    """Run the generic Agent with injectable model, tool, and storage edges."""
 
     def __init__(self, dependencies: ServiceDependencies | None = None):
         self.dependencies = dependencies or ServiceDependencies()
         self._agent: Any | None = None
+        self._agent_lock = asyncio.Lock()
 
     @classmethod
-    def with_defaults(cls) -> "TravelOpsService":
-        """Create a service whose defaults lazily reuse the existing app modules."""
-        async def process_attachments(
-            attachments: list[Attachment], *, user_id: str
-        ) -> tuple[list[ExtractedDocument], list[Evidence]]:
-            from src.attachments.factory import get_default_image_vlm_processor
-
-            processor = get_default_image_vlm_processor()
-            return await processor(attachments, user_id=user_id)
-
-        from src.planning import ItineraryPlanningService
-        from src.storage.trip_store import SQLiteTripRepository
-
-        return cls(
-            ServiceDependencies(
-                attachment_processor=process_attachments,
-                planning_service=ItineraryPlanningService(SQLiteTripRepository()),
-            )
-        )
+    def with_defaults(cls) -> "AgentService":
+        from src.agent.composition import build_default_dependencies
+        return cls(build_default_dependencies())
 
     def _load_defaults(self) -> None:
         dependencies = self.dependencies
+        if dependencies.extraction_policy_resolver is None:
+            from src.skills.registry import resolve_skill_extraction_policy
+
+            dependencies.extraction_policy_resolver = (
+                resolve_skill_extraction_policy
+            )
         if (
             dependencies.agent_factory is not None
             and dependencies.primary_model is not None
@@ -259,25 +270,11 @@ class TravelOpsService:
         from src.policies import critic
         from src.skills.registry import load_skill, select_skill
         from src.tracing.execution_trace import run_with_evidence
-        from src.planning import ItineraryPlanningService, build_planning_tools
-        from src.storage.trip_store import SQLiteTripRepository
 
-        dependencies.planning_service = dependencies.planning_service or (
-            ItineraryPlanningService(SQLiteTripRepository())
-        )
 
         async def default_tool_provider():
-            mcp_tools = await travel_agent.get_travel_mcp_tools()
-            return [
-                travel_agent.get_weather,
-                travel_agent.search_nearby_hotels,
-                travel_agent.recommend_attractions,
-                travel_agent.plan_route,
-                travel_agent.record_expenses,
-                travel_agent.get_expense_summary,
-                *build_planning_tools(dependencies.planning_service),
-                *mcp_tools,
-            ]
+            return await load_enabled_tools()
+                
 
         dependencies.tool_provider = dependencies.tool_provider or default_tool_provider
         dependencies.agent_factory = dependencies.agent_factory or travel_agent.build_agent
@@ -332,11 +329,14 @@ class TravelOpsService:
         dependencies.long_term_memory_retriever = (
             dependencies.long_term_memory_retriever
             or (
-                lambda user_id, query, trip_id: retrieve_long_term(
+                lambda user_id, query, context: retrieve_long_term(
                     memory_repository,
                     user_id=user_id,
                     query=query,
-                    trip_id=trip_id,
+                    domain=context.domain,
+                    workflow_id=context.workflow_id,
+                    scope_id=context.scope_id,
+                    thread_id=context.thread_id,
                     vector_index=memory_vector_index,
                     limit=settings.LONG_TERM_MEMORY_RETRIEVAL_LIMIT,
                     char_budget=settings.LONG_TERM_MEMORY_CHAR_BUDGET,
@@ -347,12 +347,10 @@ class TravelOpsService:
             async def record_long_term_memory(
                 request: AgentRunRequest,
                 result: AgentRunResult,
+                context: MemoryContext,
             ) -> Any:
                 if not request.query or result.status == RunStatus.FAILED:
                     return []
-                trip_id = request.trip_id
-                if trip_id is None and result.trip_state is not None:
-                    trip_id = result.trip_state.trip_id
                 turns = await asyncio.to_thread(
                     list_recent_turns,
                     request.user_id,
@@ -365,7 +363,9 @@ class TravelOpsService:
                     user_id=request.user_id,
                     thread_id=request.thread_id,
                     turns=turns,
-                    trip_id=trip_id,
+                    scope_id=context.scope_id,
+                    domain=context.domain,
+                    workflow_id=context.workflow_id,
                     minimum_turns=settings.LONG_TERM_MEMORY_BATCH_TURNS,
                 )
 
@@ -390,19 +390,65 @@ class TravelOpsService:
             and hasattr(dependencies.trace_store, "record_step")
         ):
             dependencies.run_step_recorder = dependencies.trace_store.record_step
-
-    async def _get_agent(self) -> Any:
-        self._load_defaults()
-        if self._agent is None:
-            assert self.dependencies.agent_factory is not None
-            tools = None
-            if self.dependencies.tool_provider is not None:
-                tools = await self.dependencies.tool_provider()
-            self._agent = await self.dependencies.agent_factory(
-                primary_model=self.dependencies.primary_model,
-                tools=tools,
-                checkpointer_instance=self.dependencies.checkpoint_store,
+    # 加载状态
+    async def _load_state_contexts(
+        self,
+        request: AgentRunRequest,
+    ) -> list[StateContext]:
+        contexts: list[StateContext] = []
+        for adapter in self.dependencies.state_adapters:
+            context = await _maybe_await(
+                adapter.load_context(request)
             )
+            if context is not None:
+                contexts.append(context)
+
+        return contexts
+    # 状态收集
+    async def _collect_state_outcome(
+        self,
+        *,
+        request: AgentRunRequest,
+        trace: ExecutionTrace,
+        state_contexts: list[StateContext],
+    ) -> StateOutcome:
+        outcome = StateOutcome()
+        contexts_by_name = {
+            context.adapter: context
+            for context in state_contexts
+        }
+
+        for adapter in self.dependencies.state_adapters:
+            adapter_outcome = await _maybe_await(
+                adapter.collect_outcome(
+                    request,
+                    trace,
+                    contexts_by_name.get(adapter.name),
+                )
+            )
+            if adapter_outcome is not None:
+                outcome.merge(adapter_outcome)
+
+        return outcome
+    
+    async def _get_agent(self) -> Any:
+        if self._agent is not None:
+            return self._agent
+        async with self._agent_lock:
+            if self._agent is not None:
+                    return self._agent
+            
+        self._load_defaults()
+        assert self.dependencies.agent_factory is not None
+        tools = []
+        if self.dependencies.tool_provider is not None:
+            tools = await self.dependencies.tool_provider()
+        logger.info("创建唯一的 Agent with %d tools", len(tools))
+        self._agent = await self.dependencies.agent_factory(
+            primary_model=self.dependencies.primary_model,
+            tools=tools,
+            checkpointer_instance=self.dependencies.checkpoint_store,
+        )
         return self._agent
 
     async def run(
@@ -417,9 +463,10 @@ class TravelOpsService:
         started_clock = perf_counter()
         attempt_traces: list[ExecutionTrace] = []
         run_warnings: list[str] = []
+        memory_context = self._memory_context(request, None)
         if request.attachments and self.dependencies.attachment_processor is None:
             raise UnsupportedAttachmentError(
-                "Attachment ingestion is not configured for this TravelOps service."
+                "Attachment ingestion is not configured for this Agent service."
             )
 
         try:
@@ -437,12 +484,17 @@ class TravelOpsService:
                     )
             agent = await self._get_agent()
             config = self._agent_config(request)
+            state_contexts = await self._load_state_contexts(request)
+            config["configurable"]["state_context_messages"] = [
+                content for context in state_contexts for content in context.messages
+            ]
             if recover:
                 logger.info("[收到恢复请求] request_id=%s", request.request_id)
                 recovered_result = await self._resume_pending_checkpoint(
                     request=request,
                     agent=agent,
                     config=config,
+                    state_contexts=state_contexts,
                     started_at=started_at,
                     started_clock=started_clock,
                     run_warnings=run_warnings,
@@ -456,13 +508,32 @@ class TravelOpsService:
                 )
                 if recovered_result is not None:
                     return recovered_result
+            selected_skill = None
+            if (
+                request.query
+                and dependencies.skill_selector
+                and dependencies.primary_model
+            ):
+                selected_skill = await dependencies.skill_selector(
+                    dependencies.primary_model,
+                    request.query,
+                )
+            memory_context = self._memory_context(request, selected_skill)
+            extraction_policy = None
+            if request.attachments:
+                assert dependencies.extraction_policy_resolver is not None
+                extraction_policy = dependencies.extraction_policy_resolver(
+                    selected_skill
+                )
             # 附件处理及证据校验
             extracted_documents: list[ExtractedDocument] = []
             evidence: list[Evidence] = []
             if request.attachments and dependencies.attachment_processor is not None:
+                assert extraction_policy is not None
                 extracted_documents, evidence = await dependencies.attachment_processor(
                     request.attachments,
                     user_id=request.user_id,
+                    extraction_policy=extraction_policy,
                 )
             attachment_evidence = _build_attachment_evidence_context(
                 request.attachments, extracted_documents, evidence
@@ -474,23 +545,6 @@ class TravelOpsService:
                 )
             # 注入历史记忆和偏好
             messages: list[dict[str, str]] = []
-            current_trip: TripState | None = None
-            if request.trip_id and dependencies.planning_service is not None:
-                current_trip = await asyncio.to_thread(
-                    dependencies.planning_service.repository.get,
-                    request.user_id,
-                    request.trip_id,
-                )
-                messages.append(
-                    {
-                        "role": "system",
-                        "content": (
-                            "Current persisted TripState. Treat it as the base version for "
-                            "all replanning and never mutate it without explicit confirmation:\n"
-                            + current_trip.model_dump_json()
-                        ),
-                    }
-                )
             if extracted_documents:
                 messages.append(
                     {
@@ -509,7 +563,7 @@ class TravelOpsService:
                     long_term_memory = dependencies.long_term_memory_retriever(
                         request.user_id,
                         request.query,
-                        request.trip_id,
+                        memory_context,
                     )
                 except Exception as error:
                     long_term_memory = ""
@@ -526,22 +580,18 @@ class TravelOpsService:
                 if memory:
                     messages.append({"role": "system", "content": memory})
 
-            # 技能路由
-            selected_skill = None
-            if request.query and dependencies.skill_selector and dependencies.primary_model:
-                selected_skill = await dependencies.skill_selector(
-                    dependencies.primary_model, request.query
+            if selected_skill and dependencies.skill_loader:
+                messages.append(
+                    {
+                        "role": "system",
+                        "content": "按以下 Skill 处理本轮请求：\n\n"
+                        + dependencies.skill_loader(selected_skill),
+                    }
                 )
-                if selected_skill and dependencies.skill_loader:
-                    messages.append(
-                        {
-                            "role": "system",
-                            "content": "按以下 TravelOps Skill 处理本轮请求：\n\n"
-                            + dependencies.skill_loader(selected_skill),
-                        }
-                    )
             if request.query:
                 messages.append({"role": "user", "content": request.query})
+            
+            config["configurable"]["tool_patterns"] = self._skill_tool_patterns(selected_skill)
 
             retry_count = 0
             # 主流程
@@ -588,8 +638,9 @@ class TravelOpsService:
                 attempt_traces=attempt_traces,
                 extracted_documents=extracted_documents,
                 evidence=evidence,
-                current_trip=current_trip,
+                state_contexts=state_contexts,
                 selected_skill=selected_skill,
+                memory_context=memory_context,
                 retry_count=retry_count,
                 started_at=started_at,
                 started_clock=started_clock,
@@ -619,7 +670,7 @@ class TravelOpsService:
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc),
             )
-            await self._record_result(request, result)
+            await self._record_result(request, result, memory_context)
             return result
 
     @staticmethod
@@ -632,8 +683,62 @@ class TravelOpsService:
                 "user_id": request.user_id,
                 "request_id": str(request.request_id),
                 "public_thread_id": request.thread_id,
+                "tool_patterns":[],
+                "state_context_messages": [],
             }
         }
+
+    @staticmethod
+    def _memory_context(
+        request: AgentRunRequest,
+        selected_skill: dict[str, Any] | None,
+    ) -> MemoryContext:
+        if selected_skill is None and request.state_adapter:
+            from src.skills.registry import get_skill_by_state_adapter
+
+            selected_skill = get_skill_by_state_adapter(
+                request.state_adapter
+            )
+        domain = "general"
+        workflow_id = request.state_adapter
+        if selected_skill:
+            domain = str(selected_skill.get("domain") or "general")
+            workflow_id = (
+                selected_skill.get("state_adapter")
+                or selected_skill.get("name")
+                or workflow_id
+            )
+        scope_id = request.state_id or request.trip_id
+        return MemoryContext(
+            domain=domain,
+            workflow_id=(
+                str(workflow_id).strip()
+                if workflow_id is not None and str(workflow_id).strip()
+                else None
+            ),
+            scope_id=str(scope_id) if scope_id is not None else None,
+            thread_id=request.thread_id,
+        )
+    
+    @staticmethod
+    def _skill_tool_patterns(
+        skill: dict[str, Any] | None,
+    ) -> list[str]:
+        if not skill:
+            return []
+
+        raw = skill.get("tools", "")
+        if isinstance(raw, (list, tuple, set)):
+            values = raw
+        else:
+            values = re.split(r"[,;\n]+", str(raw))
+
+        return [
+            str(value).strip()
+            for value in values
+            if str(value).strip()
+            and str(value).strip().casefold() not in {"*", "all"}
+        ]
 
     @staticmethod
     async def _has_pending_checkpoint(
@@ -663,6 +768,7 @@ class TravelOpsService:
         request: AgentRunRequest,
         agent: Any,
         config: dict[str, Any],
+        state_contexts: list[StateContext],
         started_at: datetime,
         started_clock: float,
         run_warnings: list[str],
@@ -688,8 +794,9 @@ class TravelOpsService:
                 attempt_traces=attempt_traces,
                 extracted_documents=[],
                 evidence=[],
-                current_trip=None,
+                state_contexts=state_contexts,
                 selected_skill=None,
+                memory_context=self._memory_context(request, None),
                 retry_count=0,
                 started_at=started_at,
                 started_clock=started_clock,
@@ -721,7 +828,11 @@ class TravelOpsService:
                 started_at=started_at,
                 completed_at=datetime.now(timezone.utc),
             )
-            await self._record_result(request, result)
+            await self._record_result(
+                request,
+                result,
+                self._memory_context(request, None),
+            )
             return result
 
     async def _invoke_trace_runner(
@@ -796,8 +907,9 @@ class TravelOpsService:
         attempt_traces: list[ExecutionTrace],
         extracted_documents: list[ExtractedDocument],
         evidence: list[Evidence],
-        current_trip: TripState | None,
-        selected_skill: dict[str, str] | None,
+        state_contexts: list[StateContext],
+        selected_skill: dict[str, Any] | None,
+        memory_context: MemoryContext,
         retry_count: int,
         started_at: datetime,
         started_clock: float,
@@ -805,14 +917,14 @@ class TravelOpsService:
     ) -> AgentRunResult:
         trace = self._combine_traces(attempt_traces, started_at)
         tool_calls = self._tool_call_records(trace)
-        trip_state, events, pending_confirmations = await self._planning_outcome(
+        state_outcome = await self._collect_state_outcome(
             request=request,
             trace=trace,
-            current_trip=current_trip,
+            state_contexts=state_contexts,
         )
         status = (
             RunStatus.AWAITING_CONFIRMATION
-            if pending_confirmations
+            if state_outcome.pending_confirmations
             else RunStatus.SUCCEEDED if response.strip() else RunStatus.FAILED
         )
         result = AgentRunResult(
@@ -823,13 +935,15 @@ class TravelOpsService:
             selected_skill=(
                 selected_skill.get("name") if selected_skill else None
             ),
-            trip_state=trip_state,
-            events=events,
+            state=state_outcome.state,
+            trip_state=state_outcome.legacy_state,
+            events=state_outcome.events,
+            artifacts=state_outcome.artifacts,
             extracted_documents=extracted_documents,
             evidence=evidence,
             tool_calls=tool_calls,
             trace=trace,
-            pending_confirmations=pending_confirmations,
+            pending_confirmations=state_outcome.pending_confirmations,
             error=None if response.strip() else "Agent returned an empty response.",
             metrics=RunMetrics(
                 duration_ms=round(
@@ -845,68 +959,24 @@ class TravelOpsService:
             completed_at=datetime.now(timezone.utc),
             warnings=run_warnings,
         )
-        await self._record_result(request, result)
+        await self._record_result(request, result, memory_context)
         return result
 
-    async def _planning_outcome(
-        self,
-        *,
-        request: AgentRunRequest,
-        trace: ExecutionTrace,
-        current_trip: TripState | None,
-    ) -> tuple[TripState | None, list[TravelEvent], list[ConfirmationRequest]]:
-        planner = self.dependencies.planning_service
-        if planner is None:
-            return current_trip, [], []
-        trip_state = current_trip
-        events: list[TravelEvent] = []
-        confirmations: list[ConfirmationRequest] = []
-        for span in trace.spans:
-            if span.kind != TraceSpanKind.TOOL or span.status != TraceSpanStatus.SUCCEEDED:
-                continue
-            if span.name not in {
-                "create_trip_plan", "propose_trip_replan", "confirm_trip_replan"
-            }:
-                continue
-            try:
-                payload = json.loads(str(span.output))
-                trip_id = payload["trip_id"]
-                if payload["operation"] in {"trip_created", "replan_confirmed"}:
-                    trip_state = await asyncio.to_thread(
-                        planner.repository.get, request.user_id, trip_id
-                    )
-                elif payload["operation"] == "replan_proposed":
-                    proposal = await asyncio.to_thread(
-                        planner.repository.get_proposal,
-                        request.user_id,
-                        trip_id,
-                        payload["proposal_id"],
-                    )
-                    trip_state = await asyncio.to_thread(
-                        planner.repository.get, request.user_id, trip_id
-                    )
-                    events.append(proposal.event)
-                    confirmations.append(
-                        ConfirmationRequest(
-                            action="confirm_trip_replan",
-                            prompt="是否应用该重规划方案？",
-                            payload=proposal.model_dump(mode="json"),
-                            evidence_ids=proposal.event.evidence_ids,
-                        )
-                    )
-            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
-                raise RuntimeError(
-                    f"Invalid planning tool result from {span.name}: {error}"
-                ) from error
-        return trip_state, events, confirmations
 
     async def _record_result(
-        self, request: AgentRunRequest, result: AgentRunResult
+        self,
+        request: AgentRunRequest,
+        result: AgentRunResult,
+        memory_context: MemoryContext,
     ) -> None:
-        recorders = []
+        recorders: list[tuple[str, Callable[..., Any], tuple[Any, ...]]] = []
         if self.dependencies.conversation_recorder and result.answer:
             recorders.append(
-                ("conversation", self.dependencies.conversation_recorder)
+                (
+                    "conversation",
+                    self.dependencies.conversation_recorder,
+                    (request, result),
+                )
             )
         if (
             self.dependencies.long_term_memory_recorder
@@ -922,14 +992,17 @@ class TravelOpsService:
                 (
                     "long-term memory",
                     self.dependencies.long_term_memory_recorder,
+                    (request, result, memory_context),
                 )
             )
         if self.dependencies.trace_recorder:
-            recorders.append(("trace", self.dependencies.trace_recorder))
+            recorders.append(
+                ("trace", self.dependencies.trace_recorder, (request, result))
+            )
 
-        for name, recorder in recorders:
+        for name, recorder, args in recorders:
             try:
-                await _maybe_await(recorder(request, result))
+                await _maybe_await(recorder(*args))
             except Exception as error:
                 result.warnings.append(f"Failed to persist {name}: {error}")
 
@@ -1026,3 +1099,7 @@ class TravelOpsService:
             for span in trace.spans
             if span.kind == TraceSpanKind.TOOL
         ]
+
+
+# Compatibility alias retained while callers migrate to AgentService.
+TravelOpsService = AgentService

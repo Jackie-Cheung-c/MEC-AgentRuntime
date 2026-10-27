@@ -1,31 +1,13 @@
-"""MCP connections used by TravelTrace Agent."""
+"""Backward-compatible MCP entrypoint."""
 
-import os
+from typing import Any
 
-from langchain_mcp_adapters.client import MultiServerMCPClient
+from src.tools.mcp import default_mcp_manager
 
 
-async def get_travel_mcp_tools():
-    """Discover train and flight tools exposed by local MCP servers."""
-    variflight_key = os.getenv("VARIFLIGHT_API_KEY", "").strip()
-    if not variflight_key:
-        raise RuntimeError(
-            "VARIFLIGHT_API_KEY is not configured. Set it as an environment variable "
-            "before starting TravelTrace Agent."
-        )
-    client = MultiServerMCPClient(
-        {
-            "12306-mcp": {
-                "transport": "stdio",
-                "command": "npx.cmd",
-                "args": ["-y", "12306-mcp"],
-            },
-            "variflight": {
-                "transport": "stdio",
-                "command": "npx.cmd",
-                "args": ["-y", "@variflight-ai/variflight-mcp"],
-                "env": {**os.environ, "VARIFLIGHT_API_KEY": variflight_key},
-            },
-        }
-    )
-    return await client.get_tools()
+async def get_travel_mcp_tools() -> list[Any]:
+    """Return all currently available travel MCP tools.
+
+    Missing credentials and unavailable MCP servers are skipped by MCPManager.
+    """
+    return await default_mcp_manager().load_tools()

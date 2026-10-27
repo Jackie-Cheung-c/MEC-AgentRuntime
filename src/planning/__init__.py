@@ -1,13 +1,13 @@
-"""Itinerary planning and replanning services."""
+"""Backward-compatible imports for the migrated travel planning services."""
 
-from src.planning.planning_chain import (
+from src.travel import (
     ItineraryPlanningService,
     PlanningError,
     ProposalConflictError,
     TripNotFoundError,
     TripVersionConflictError,
+    build_planning_tools,
 )
-from src.planning.tools import build_planning_tools
 
 __all__ = [
     "ItineraryPlanningService",

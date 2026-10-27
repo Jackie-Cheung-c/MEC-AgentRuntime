@@ -1,0 +1,63 @@
+{
+  "quick_prompts": [
+    {
+      "title": "整理凭证中的行程",
+      "prompt": "根据当前凭证整理我的行程安排",
+      "description": "从已审核字段生成行程"
+    },
+    {
+      "title": "检查行程时间冲突",
+      "prompt": "检查当前行程是否存在时间冲突",
+      "description": "比对航班、酒店与景点时间"
+    },
+    {
+      "title": "汇总凭证费用",
+      "prompt": "总结当前凭证中的费用信息",
+      "description": "按类别统计凭证金额"
+    }
+  ],
+  "tool_entries": [
+    {
+      "capability_id": "weather.current",
+      "title": "天气",
+      "prompt": "查询上海明天的天气",
+      "description": "目的地天气与出行建议"
+    },
+    {
+      "capability_id": "places.attraction.recommend",
+      "title": "景点",
+      "prompt": "推荐杭州适合一日游的景点",
+      "description": "目的地景点与游玩建议"
+    },
+    {
+      "capability_id": "places.hotel.search",
+      "title": "酒店",
+      "prompt": "推荐上海外滩附近评分较高的酒店",
+      "description": "按区域查找住宿"
+    },
+    {
+      "capability_id": "maps.route.plan",
+      "title": "路线",
+      "prompt": "规划从上海虹桥站到外滩的路线",
+      "description": "比较交通路线与耗时"
+    },
+    {
+      "capability_id": "finance.expense.record",
+      "title": "记费用",
+      "prompt": "记录一笔 120 元的交通费用",
+      "description": "记录旅行支出"
+    },
+    {
+      "capability_id": "finance.expense.summary",
+      "title": "费用汇总",
+      "prompt": "汇总我的旅行费用",
+      "description": "查看预算与支出"
+    },
+    {
+      "capability_id": "mcp.travel",
+      "title": "票务",
+      "prompt": "查询明天上海到北京的高铁班次",
+      "description": "铁路与航班信息"
+    }
+  ]
+}

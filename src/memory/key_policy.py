@@ -13,8 +13,34 @@ class MemoryValueCardinality(StrEnum):
     MULTI = "multi"
 
 
+GENERAL_DOMAIN = "general"
+TRAVEL_DOMAIN = "travel"
+
+CROSS_DOMAIN_KEYS = {
+    "name",
+    "language",
+    "timezone",
+    "home_city",
+    "food_like",
+    "dietary_restriction",
+    "accessibility_requirement",
+}
+
+TRAVEL_DOMAIN_KEYS = {
+    "preferred_departure_city",
+    "preferred_transport",
+    "preferred_hotel_level",
+    "seat_preference",
+    "travel_pace",
+    "travel_interest",
+    "visited_destination",
+    "completed_trip",
+}
+
 SINGLE_VALUE_KEYS = {
     "name",
+    "language",
+    "timezone",
     "home_city",
     "preferred_departure_city",
     "preferred_transport",
@@ -31,6 +57,13 @@ MULTI_VALUE_KEYS = {
     "visited_destination",
     "completed_trip",
 }
+
+def memory_domain_for_key(memory_key: str) -> str | None:
+    if memory_key in CROSS_DOMAIN_KEYS:
+        return GENERAL_DOMAIN
+    if memory_key in TRAVEL_DOMAIN_KEYS:
+        return TRAVEL_DOMAIN
+    return None
 
 
 def memory_value_cardinality(

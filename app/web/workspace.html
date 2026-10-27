@@ -3,8 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>TravelTrace | 多模态旅行工作台</title>
-  <link rel="stylesheet" href="/static/workspace.css?v=20260922-auth-2">
+  <title>MEC-Agent | 多模态 Agent 工作台</title>
+  <link rel="stylesheet" href="/static/workspace.css?v=20261026-capabilities-1">
 </head>
 <body>
   <div id="auth-gate" class="auth-gate">
@@ -39,7 +39,7 @@
       <header class="sidebar-head">
         <a class="brand" href="/">
           <span class="brand-mark">TT</span>
-          <span class="brand-text"><strong>TravelTrace</strong><small>Multimodal Agent</small></span>
+          <span class="brand-text"><strong>MEC-Agent</strong><small>Multimodal Agent</small></span>
         </a>
         <button id="sidebar-toggle" class="ghost-icon" type="button" title="收起侧边栏" aria-label="收起侧边栏">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"/></svg>
@@ -99,7 +99,7 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>
           </button>
           <div>
-            <p id="view-kicker" class="kicker">TRAVELOPS AGENT</p>
+            <p id="view-kicker" class="kicker">AGENT WORKSPACE</p>
             <h1 id="view-title">智能对话</h1>
           </div>
         </div>
@@ -114,13 +114,10 @@
           <div class="chat-column">
             <div id="chat-empty" class="chat-empty">
               <div class="chat-symbol">TT</div>
-              <h2>今天想处理哪段行程？</h2>
-              <p>直接提问，或先上传旅行凭证并完成字段审核。</p>
-              <div class="prompt-grid">
-                <button type="button" data-prompt="根据当前凭证整理我的行程安排"><strong>整理凭证中的行程</strong><small>从已审核字段生成行程</small></button>
-                <button type="button" data-prompt="检查当前行程是否存在时间冲突"><strong>检查行程时间冲突</strong><small>比对航班、酒店与景点时间</small></button>
-                <button type="button" data-prompt="总结当前凭证中的费用信息"><strong>汇总凭证费用</strong><small>按类别统计凭证金额</small></button>
-              </div>
+              <h2 id="chat-empty-title">今天想处理什么任务？</h2>
+              <p id="chat-empty-copy">直接提问，或先上传文档并完成证据审核。</p>
+              <div id="quick-prompt-grid" class="prompt-grid"></div>
+              <div id="tool-entry-grid" class="tool-entry-grid" aria-label="快捷工具" hidden></div>
             </div>
             <div id="messages" class="messages"></div>
           </div>
@@ -156,8 +153,8 @@
             <div id="drop-zone" class="drop-zone">
               <input id="file-input" type="file" accept="image/jpeg,image/png,image/webp" hidden>
               <div class="upload-mark">＋</div>
-              <h2>上传旅行凭证</h2>
-              <p>将机票、车票、酒店订单、通知或收据拖到这里</p>
+              <h2>上传文档</h2>
+              <p id="upload-document-types">将文档拖到这里</p>
               <button id="choose-file" class="secondary-button" type="button">选择图片</button>
               <small>支持 JPEG、PNG、WebP，最大 10 MiB</small>
             </div>
@@ -186,14 +183,14 @@
       <section id="review-view" class="view" data-view-panel="review" hidden>
         <div id="review-empty" class="review-empty">
           <h2>尚未选择附件</h2>
-          <p>从附件上传页或左侧最近附件中选择一份凭证。</p>
+          <p>从附件上传页或左侧最近附件中选择一份文档。</p>
           <button class="primary-button" type="button" data-switch="upload">前往上传</button>
         </div>
 
         <div id="review-workspace" class="review-grid" hidden>
           <section class="document-pane">
             <header class="pane-header">
-              <h2 id="document-title">原始凭证</h2>
+              <h2 id="document-title">原始文档</h2>
               <div class="image-tools">
                 <button id="zoom-out" type="button" title="缩小">−</button><span id="zoom-value">100%</span>
                 <button id="zoom-in" type="button" title="放大">＋</button><button id="zoom-reset" type="button">重置</button>
@@ -201,7 +198,7 @@
             </header>
             <div class="image-stage">
               <div id="image-frame" class="image-frame">
-                <img id="document-image" alt="上传的旅行凭证">
+                <img id="document-image" alt="上传的文档">
                 <div id="evidence-box" class="evidence-box" hidden></div>
               </div>
               <div id="image-loading" class="image-loading">正在读取图片...</div>
@@ -257,7 +254,7 @@
           <div class="memory-summary">
             <div><span>条目</span><strong id="memory-count">0</strong></div>
             <div><span>全局</span><strong id="memory-global-count">0</strong></div>
-            <div><span>行程级</span><strong id="memory-trip-count">0</strong></div>
+            <div><span>上下文级</span><strong id="memory-trip-count">0</strong></div>
             <div><span>会话级</span><strong id="memory-thread-count">0</strong></div>
           </div>
           <div id="memory-list" class="memory-list">
@@ -267,6 +264,6 @@
       </section>
     </main>
   </div>
-  <script src="/static/workspace.js?v=20260922-auth-2"></script>
+  <script src="/static/workspace.js?v=20261026-capabilities-1"></script>
 </body>
 </html>

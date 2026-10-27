@@ -4,16 +4,10 @@ from langchain.tools import tool
 from config import settings
 import aiosqlite
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from src.agent.state_context import StateContextMiddleware
 from src.prompts.prompt_manager import prompt_manager
-from src.tools.weather_tool import get_weather
-from src.tools.hotel_tool import search_nearby_hotels
-from src.tools.search_tool import recommend_attractions
-from src.tools.traffic_recommand_tool import plan_route
-from src.tools.expenses_tool import get_expense_summary, record_expenses
-from src.skills.registry import load_skill, select_skill
-from src.tools.mcp_client import get_travel_mcp_tools
-import os
-
+from src.tools.catalog import load_enabled_tools
+from src.agent.tool_selection import DynamicToolSelectionMiddleware
 
 model = init_chat_model(
     model = "deepseek-v4-flash",
@@ -72,18 +66,10 @@ async def build_agent(
     tools=None,
     checkpointer_instance=None,
 ):
-    """Build the Agent after the async event loop is available for MCP."""
+    """Build the single universal Agent after the event loop is available."""
     if tools is None:
-        mcp_tools = await get_travel_mcp_tools()
-        tools = [
-            get_weather,
-            search_nearby_hotels,
-            recommend_attractions,
-            plan_route,
-            record_expenses,
-            get_expense_summary,
-            *mcp_tools,
-        ]
+        tools = await load_enabled_tools()
+        
     active_checkpointer = (
         checkpointer_instance
         if checkpointer_instance is not None
@@ -94,6 +80,9 @@ async def build_agent(
         model=primary_model if primary_model is not None else model,
         tools=tools,
         system_prompt=SYSTEM_PROMPT,
+        middleware=[
+            StateContextMiddleware(),
+            DynamicToolSelectionMiddleware()],
         checkpointer=active_checkpointer,
     )
 

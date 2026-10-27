@@ -12,7 +12,12 @@ from uuid import UUID
 from langchain_chroma import Chroma
 from langchain_community.embeddings import DashScopeEmbeddings
 
-from src.memory.models import MemoryItem, MemoryScope, MemoryStatus
+from src.memory.models import (
+    MemoryContext,
+    MemoryItem,
+    MemoryScope,
+    MemoryStatus,
+)
 from src.paths import DATA_DIR
 
 
@@ -31,7 +36,10 @@ def _memory_text(item: MemoryItem) -> str:
             f"category: {item.category.value}",
             f"key: {item.memory_key}",
             f"value: {item.value}",
+            f"domain: {item.domain}",
+            f"workflow: {item.workflow_id or ''}",
             f"scope: {item.scope.value}",
+            f"scope_id: {item.scope_id or ''}",
             f"evidence: {item.evidence_quote or ''}",
         )
     )
@@ -67,8 +75,10 @@ class ChromaMemoryVectorIndex:
                     "memory_id": str(item.memory_id),
                     "user_id": item.user_id,
                     "category": item.category.value,
+                    "domain": item.domain,
+                    "workflow_id": item.workflow_id or "",
                     "scope": item.scope.value,
-                    "trip_id": str(item.trip_id) if item.trip_id else "",
+                    "scope_id": item.scope_id or "",
                     "thread_id": item.thread_id or "",
                     "status": item.status.value,
                 }
@@ -93,7 +103,7 @@ class ChromaMemoryVectorIndex:
         *,
         user_id: str,
         query: str,
-        trip_id: UUID | str | None,
+        context: MemoryContext,
         limit: int,
     ) -> list[MemoryVectorHit]:
         if not query.strip() or limit <= 0:
@@ -103,18 +113,52 @@ class ChromaMemoryVectorIndex:
             {"user_id": user_id},
             {"status": MemoryStatus.ACTIVE.value},
         ]
-        scopes: list[dict[str, Any]] = []
-        scopes.append({"scope": MemoryScope.GLOBAL.value})
-        if trip_id is not None:
-            scopes.append(
+        scope_filters: list[dict[str, Any]] = [
+            {"scope": MemoryScope.GLOBAL.value}
+        ]
+        if context.scope_id is not None:
+            scope_filters.append(
                 {
                     "$and": [
-                        {"scope": MemoryScope.TRIP.value},
-                        {"trip_id": str(trip_id)},
+                        {"scope": MemoryScope.CONTEXT.value},
+                        {"scope_id": context.scope_id},
                     ]
                 }
             )
-        filters.append(scopes[0] if len(scopes) == 1 else {"$or": scopes})
+        if context.thread_id is not None:
+            scope_filters.append(
+                {
+                    "$and": [
+                        {"scope": MemoryScope.THREAD.value},
+                        {"thread_id": context.thread_id},
+                    ]
+                }
+            )
+        filters.append({"$or": scope_filters})
+        filters.append(
+            {
+                "$or": [
+                    {"domain": "general"},
+                    {
+                        "$and": [
+                            {"domain": context.domain},
+                            {
+                                "$or": [
+                                    {"scope": MemoryScope.GLOBAL.value},
+                                    {"workflow_id": ""},
+                                    {
+                                        "workflow_id": (
+                                            context.workflow_id
+                                            or "__no_workflow__"
+                                        )
+                                    },
+                                ]
+                            },
+                        ]
+                    },
+                ]
+            }
+        )
 
         try:
             results = self.store.similarity_search_with_score(

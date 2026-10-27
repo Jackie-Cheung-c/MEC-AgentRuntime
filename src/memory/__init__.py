@@ -3,6 +3,7 @@
 from src.memory.models import (
     MemoryCandidate,
     MemoryCategory,
+    MemoryContext,
     MemoryExtraction,
     MemoryItem,
     MemoryScope,
@@ -29,6 +30,7 @@ __all__ = [
     "MemoryCandidate",
     "MemoryCategory",
     "ChromaMemoryVectorIndex",
+    "MemoryContext",
     "MemoryExtraction",
     "MemoryExtractionError",
     "MemoryItem",

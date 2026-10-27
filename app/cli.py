@@ -1,5 +1,5 @@
 import asyncio
-from src.agent.service import TravelOpsService
+from src.agent.service import AgentService
 from src.domain import AgentRunRequest, RunStatus
 import argparse
 
@@ -9,8 +9,8 @@ import argparse
 
 async def run_agent(user_id:str,thread_id:str) -> None:
     """Run the CLI through the same application service as the HTTP API."""
-    service = TravelOpsService.with_defaults()
-    print("TravelOps 智能旅行助手。输入 exit 或 quit 结束对话。")
+    service = AgentService.with_defaults()
+    print("TravelTrace Agent 工作台。输入 exit 或 quit 结束对话。")
 
     while True:
         try:
