@@ -14,5 +14,5 @@ tiktoken
 jieba
 PyJWT
 argon2-cffi
-aiosqlite
 dashscope
+aiosqlite
