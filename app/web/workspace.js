@@ -1,16 +1,37 @@
 const byId = (id) => document.getElementById(id);
 
 const state = {
-  view: 'chat', attachment: null, attachments: [], extraction: null,
-  evidenceById: new Map(), originalValues: new Map(), dirtyPaths: new Set(),
-  zoom: 100, busy: false, threadId: crypto.randomUUID(), localPreviewUrl: null,
-  selectedFile: null, threads: [], historyRequestId: 0,
-  historyReadyForUser: null, threadOpenRequestId: 0,
-  trip: null, memories: [], memoryRequestId: 0,
-  user: null, authMode: 'login',
-  initialized: false, protectedImageUrl: null,
-  pendingRequest: null, pendingUi: null,
-  capabilities: null, documentTypes: new Map(), capabilityRequestId: 0,
+  view: 'chat',
+  attachment: null,
+  attachments: [],
+  extraction: null,
+  evidenceById: new Map(),
+  originalValues: new Map(),
+  dirtyPaths: new Set(),
+  zoom: 100,
+
+  busy: false,                 // 仍然用于上传和审核操作
+  chatRuns: new Map(),         // threadId -> 当前会话的运行状态
+
+  threadId: crypto.randomUUID(),
+  localPreviewUrl: null,
+  selectedFile: null,
+  threads: [],
+  historyRequestId: 0,
+  historyReadyForUser: null,
+  threadOpenRequestId: 0,
+  trip: null,
+  memories: [],
+  memoryRequestId: 0,
+  user: null,
+  authMode: 'login',
+  initialized: false,
+  protectedImageUrl: null,
+  pendingRequest: null,
+  pendingUi: null,
+  capabilities: null,
+  documentTypes: new Map(),
+  capabilityRequestId: 0,
 };
 
 const viewMeta = {
@@ -616,7 +637,14 @@ async function saveCorrections() {
   switchView('chat');
   await sendChat('我已完成当前凭证的人工纠错。请基于已确认的结构化字段重新分析，并说明对行程安排的影响。', true);
 }
+function currentChatRun() {
+  return state.chatRuns.get(state.threadId);
+}
 
+function syncComposerState() {
+  byId('send-button').disabled =
+    state.busy || Boolean(currentChatRun());
+}
 function addMessage(role, content, pending = false) { byId('chat-empty').hidden = true; const message = document.createElement('article'); message.className = `message ${role}${pending ? ' pending' : ''}`; const avatar = document.createElement('div'); avatar.className = 'message-avatar'; avatar.textContent = role === 'user' ? '你' : 'TT'; const body = document.createElement('div'); body.className = 'message-body'; body.textContent = content; message.append(avatar, body); byId('messages').append(message); scrollChat(); return { message, body }; }
 function scrollChat() { const area = byId('chat-scroll'); area.scrollTop = area.scrollHeight; }
 function resetChatInput() {
@@ -792,10 +820,6 @@ function renderThreadList() {
   });
 }
 async function deleteThread(thread) {
-  if (state.busy) {
-    showMessage('请等待当前回答完成后再删除会话。', true);
-    return;
-  }
   const title = thread.title || '未命名会话';
   if (!window.confirm(`删除会话“${title}”？对应会话记忆也会一并删除。`)) return;
   try {
@@ -833,7 +857,7 @@ async function loadThreads() {
     if (
       state.historyReadyForUser !== requestUser
       && state.threadId === threadIdBeforeRequest
-      && !state.busy
+      && !state.chatRuns.size
     ) {
       state.historyReadyForUser = requestUser;
       const savedThreadId = localStorage.getItem(activeThreadStorageKey(requestUser));
@@ -851,10 +875,6 @@ async function loadThreads() {
 async function openThread(threadId, options = {}) {
   const thread = state.threads.find((item) => item.thread_id === threadId);
   if (!thread) return;
-  if (state.busy) {
-    showMessage('请等待当前回答完成后再切换会话。', true);
-    return;
-  }
 
   const requestId = ++state.threadOpenRequestId;
   state.threadId = threadId;
@@ -875,9 +895,24 @@ async function openThread(threadId, options = {}) {
       const answer = turn.answer || (turn.status === 'failed' ? '本轮没有生成回答。' : '');
       if (answer) {
         const rendered = addMessage('assistant', answer);
-        if (turn.status === 'failed') rendered.message.classList.add('error');
+        if (turn.status === 'failed') {
+          rendered.message.classList.add('error');
+        }
       }
     });
+    const activeRun = state.chatRuns.get(threadId);
+    if (activeRun) {
+      if (activeRun.pending.payload.query) {
+        addMessage('user', activeRun.pending.payload.query);
+      }
+      activeRun.assistant = addMessage(
+        'assistant',
+        activeRun.streamedText || '正在分析',
+        !activeRun.streamedText,
+      );
+    }
+
+    syncComposerState();
     byId('chat-empty').hidden = turns.length > 0;
     scrollChat();
   } catch (error) {
@@ -887,33 +922,55 @@ async function openThread(threadId, options = {}) {
     showMessage(`会话读取失败：${error.message}`, true);
   }
 }
-function pendingRequestStorageKey(user = userId()) {
-  return `travelops.pending_request.${user}`;
+function pendingRequestStorageKey(
+  user = userId(),
+  threadId = '',
+) {
+  const suffix = threadId ? `.${threadId}` : '';
+  return `travelops.pending_request.${user}${suffix}`;
 }
+
 function savePendingRequest(pending) {
   try {
     localStorage.setItem(
-      pendingRequestStorageKey(pending.payload.user_id),
+      pendingRequestStorageKey(
+        pending.payload.user_id,
+        pending.payload.thread_id,
+      ),
       JSON.stringify(pending),
     );
-  } catch (_) { /* 隐私模式忽略 */ }
-}
-function clearPendingRequest() {
-  if (state.pendingRequest) {
-    localStorage.removeItem(
-      pendingRequestStorageKey(state.pendingRequest.payload.user_id),
-    );
-  }
-  state.pendingRequest = null;
-  state.pendingUi = null;
-}
-function loadPendingRequest() {
-  try {
-    const raw = localStorage.getItem(pendingRequestStorageKey());
-    return raw ? JSON.parse(raw) : null;
   } catch (_) {
-    return null;
+    // 隐私模式下忽略
   }
+}
+
+function clearPendingRequest(pending) {
+  if (!pending?.payload?.thread_id) return;
+  localStorage.removeItem(
+    pendingRequestStorageKey(
+      pending.payload.user_id,
+      pending.payload.thread_id,
+    ),
+  );
+}
+
+function loadPendingRequests(user = userId()) {
+  const prefix = `travelops.pending_request.${user}.`;
+  const result = [];
+
+  for (let index = 0; index < localStorage.length; index += 1) {
+    const key = localStorage.key(index);
+    if (!key || !key.startsWith(prefix)) continue;
+
+    try {
+      const pending = JSON.parse(localStorage.getItem(key));
+      if (pending?.payload?.request_id) result.push(pending);
+    } catch (_) {
+      localStorage.removeItem(key);
+    }
+  }
+
+  return result;
 }
 function isRetryableRequestError(error) {
   if (error?.terminal) return false;
@@ -922,105 +979,152 @@ function isRetryableRequestError(error) {
   return !status || status >= 500 || status === 408 || status === 429;
 }
 async function executePendingRequest(pending, options = {}) {
-  if (!state.user || state.busy) return;
-  state.pendingRequest = pending;
-  if (!state.pendingUi) {
-    state.pendingUi = {
-      user: addMessage('user', pending.payload.query),
-      assistant: addMessage('assistant', '正在恢复任务...', true),
-    };
-  }
-  const { assistant } = state.pendingUi;
-  state.busy = true;
-  byId('send-button').disabled = true;
-  if (navigator.onLine) {
-    assistant.message.classList.remove('pending', 'streaming', 'error');
-    assistant.message.classList.add('pending');
-    assistant.body.textContent = '正在分析';
-  } else {
-    assistant.message.classList.remove('pending', 'streaming', 'error');
-    assistant.body.textContent = '网络已断开，恢复连接后将自动继续。';
-    state.busy = false;
-    byId('send-button').disabled = false;
+  if (!state.user) return;
+
+  const requestThreadId = pending.payload.thread_id;
+  
+  // 如果该会话已经在跑，拦截重复发起
+  if (!requestThreadId || state.chatRuns.has(requestThreadId)) {
     return;
   }
+
+  // 创建并记录该会话的独立运行状态
+  const run = {
+    pending,
+    threadId: requestThreadId,
+    assistant: null,
+    streamedText: '',
+  };
+  state.chatRuns.set(requestThreadId, run);
+
+  // 【关键】只有当前用户正看着这个会话，才去界面上加消息 DOM
+  if (state.threadId === requestThreadId) {
+    addMessage('user', pending.payload.query);
+    run.assistant = addMessage('assistant', '正在分析', true);
+  }
+
+  syncComposerState();
+
+  // 网络断开处理
+  if (!navigator.onLine) {
+    if (run.assistant) {
+      run.assistant.message.classList.remove('pending', 'streaming', 'error');
+      run.assistant.body.textContent = '网络已断开，恢复连接后将自动继续。';
+    }
+    state.chatRuns.delete(requestThreadId);
+    syncComposerState();
+    return;
+  }
+
   try {
-    let streamedText = '';
+    // 发起流式请求
     const result = await streamAgent(
       pending.payload,
       (chunk) => {
-        if (!streamedText) {
-          assistant.message.classList.remove('pending');
-          assistant.message.classList.add('streaming');
-          assistant.body.textContent = '';
+        run.streamedText += chunk;
+        // 如果用户切到了别的会话，后台依然接收数据，但不更新页面 DOM
+        if (state.threadId !== requestThreadId || !run.assistant) {
+          return;
         }
-        streamedText += chunk;
-        assistant.body.textContent = streamedText;
+        run.assistant.message.classList.remove('pending');
+        run.assistant.message.classList.add('streaming');
+        run.assistant.body.textContent = run.streamedText;
         scrollChat();
       },
       () => {
-        streamedText = '';
-        assistant.message.classList.remove('pending');
-        assistant.message.classList.add('streaming');
-        assistant.body.textContent = '';
+        run.streamedText = '';
+        if (state.threadId !== requestThreadId || !run.assistant) {
+          return;
+        }
+        run.assistant.message.classList.remove('pending');
+        run.assistant.message.classList.add('streaming');
+        run.assistant.body.textContent = '';
         scrollChat();
       },
     );
-    if (result.thread_id) state.threadId = result.thread_id;
-    if (result.state?.adapter === 'travel_planning') {
+
+    // 流结束，更新页面状态（前提是用户还在看这个会话）
+    if (state.threadId === requestThreadId) {
+      if (result.thread_id) state.threadId = result.thread_id;
+
+      if (result.state?.adapter === 'travel_planning') {
         state.trip = result.state.payload;
       } else if (result.trip_state) {
         state.trip = result.trip_state;
       }
-    rememberActiveThread(state.threadId);
-    assistant.message.classList.remove('pending', 'streaming');
-    assistant.body.textContent =
-      result.answer || result.error || '本轮没有生成回答。';
-    if (result.status === 'failed') assistant.message.classList.add('error');
-    clearPendingRequest();
-    if (options.automatic) {
-      showMessage('纠错已保存，Agent 已使用审核结果重新回答。');
+
+      rememberActiveThread(state.threadId);
+
+      if (run.assistant) {
+        run.assistant.message.classList.remove('pending', 'streaming');
+        run.assistant.body.textContent = result.answer || result.error || '本轮没有生成回答。';
+        if (result.status === 'failed') {
+          run.assistant.message.classList.add('error');
+        }
+      }
+
+      if (options.automatic) {
+        showMessage('纠错已保存，Agent 已使用审核结果重新回答。');
+      }
     }
+
+    // 清理 localStorage 里的 pending 记录
+    clearPendingRequest(pending);
+    
   } catch (error) {
-    assistant.message.classList.remove('pending', 'streaming');
+    const isActiveThread = state.threadId === requestThreadId;
+
+    if (isActiveThread && run.assistant) {
+      run.assistant.message.classList.remove('pending', 'streaming');
+      run.assistant.message.classList.add('error');
+      run.assistant.body.textContent = `请求失败：${error.message}`;
+    }
+
     if (error?.status === 401) {
       pending.status = 'waiting';
       pending.last_error = error.message;
       savePendingRequest(pending);
-      assistant.body.textContent = '登录已失效，重新登录后会继续该任务。';
       clearAuthentication();
       showMessage('请重新登录，任务已保留。', true);
     } else if (isRetryableRequestError(error)) {
       pending.status = 'waiting';
       pending.last_error = error.message;
       savePendingRequest(pending);
-      assistant.body.textContent =
-        `网络或服务暂时不可用，将自动重试。${error.message}`;
       showMessage('任务已保留，将在网络恢复后继续。', true);
     } else {
-      clearPendingRequest();
-      assistant.message.classList.add('error');
-      assistant.body.textContent = `请求失败：${error.message}`;
+      clearPendingRequest(pending);
       showMessage(error.message, true);
     }
   } finally {
-    state.busy = false;
-    byId('send-button').disabled = false;
-    scrollChat();
-    byId('composer-attachment').hidden = true;
+    // 无论成功失败，都要释放该会话的锁
+    state.chatRuns.delete(requestThreadId);
+    syncComposerState();
+
+    if (state.threadId === requestThreadId) {
+      scrollChat();
+      byId('composer-attachment').hidden = true;
+    }
   }
+
   await loadThreads();
 }
 async function sendChat(text, automatic = false) {
   if (!state.user) return;
+
   const query = text.trim();
+
   if (!query || state.busy) return;
-  if (state.pendingRequest) {
-    showMessage('上一项任务尚未完成，请等待自动恢复。', true);
+
+  if (state.chatRuns.has(state.threadId)) {
+    showMessage('当前会话正在回答，请新建会话或等待完成。', true);
     return;
   }
+
   resetChatInput();
+
   const requestId = crypto.randomUUID();
+  const threadId = state.threadId;
+
   const pending = {
     request_id: requestId,
     status: 'sending',
@@ -1028,46 +1132,48 @@ async function sendChat(text, automatic = false) {
     payload: {
       request_id: requestId,
       user_id: userId(),
-      thread_id: state.threadId,
+      thread_id: threadId,
       trip_id: state.trip?.trip_id || null,
       query,
       attachments: state.attachment ? [state.attachment] : [],
     },
   };
+
   savePendingRequest(pending);
   await executePendingRequest(pending, { automatic });
 }
 async function restorePendingRequest() {
-  const pending = loadPendingRequest();
-  if (!pending?.payload?.request_id) return;
-  state.threadId = pending.payload.thread_id || state.threadId;
-  state.pendingRequest = pending;
-  state.pendingUi = null;
-  switchView('chat');
-  await executePendingRequest(pending, { automatic: false });
+  const pendingList = loadPendingRequests();
+  await Promise.all(
+    pendingList.map((pending) =>
+      executePendingRequest(pending, { automatic: false })
+    ),
+  );
 }
 function retryPendingRequest() {
-  if (
-    !state.pendingRequest
-    || state.busy
-    || !navigator.onLine
-    || !state.user
-  ) return;
-  executePendingRequest(state.pendingRequest, { automatic: false });
+  if (!state.user || !navigator.onLine) return;
+
+  loadPendingRequests().forEach((pending) => {
+    const threadId = pending.payload.thread_id;
+    if (!state.chatRuns.has(threadId)) {
+      executePendingRequest(pending, { automatic: false });
+    }
+  });
 }
 function newChat() {
-  if (state.busy) {
-    showMessage('请等待当前回答完成后再新建会话。', true);
-    return;
-  }
-  clearPendingRequest();
+  // 不再因为旧会话正在回答而阻止新建会话
+
   state.threadOpenRequestId += 1;
   state.threadId = crypto.randomUUID();
   state.trip = null;
+
   forgetActiveThread();
+
   byId('messages').replaceChildren();
   byId('chat-empty').hidden = false;
+
   renderThreadList();
+  syncComposerState();
   switchView('chat');
   byId('chat-input').focus();
 }
