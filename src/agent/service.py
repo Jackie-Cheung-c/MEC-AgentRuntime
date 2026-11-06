@@ -40,6 +40,8 @@ from src.state_adapters import (
 
 from src.agent.session import build_session_key
 from src.tools.catalog import load_enabled_tools
+from src.storage.trace_store import get_active_lease
+
 logger = logging.getLogger(__name__)
 
 class UnsupportedAttachmentError(RuntimeError):
@@ -266,7 +268,7 @@ class AgentService:
         ):
             return
 
-        from src.agent import travel_agent
+        from src.agent import agent_core
         from src.policies import critic
         from src.skills.registry import load_skill, select_skill
         from src.tracing.execution_trace import run_with_evidence
@@ -277,10 +279,10 @@ class AgentService:
                 
 
         dependencies.tool_provider = dependencies.tool_provider or default_tool_provider
-        dependencies.agent_factory = dependencies.agent_factory or travel_agent.build_agent
-        dependencies.primary_model = dependencies.primary_model or travel_agent.model
-        dependencies.critic_model = dependencies.critic_model or travel_agent.critic_model
-        dependencies.compression_model = dependencies.compression_model or travel_agent.compress_model
+        dependencies.agent_factory = dependencies.agent_factory or agent_core.build_agent
+        dependencies.primary_model = dependencies.primary_model or agent_core.model
+        dependencies.critic_model = dependencies.critic_model or agent_core.critic_model
+        dependencies.compression_model = dependencies.compression_model or agent_core.compress_model
         dependencies.skill_selector = dependencies.skill_selector or select_skill
         dependencies.skill_loader = dependencies.skill_loader or load_skill
         dependencies.trace_runner = dependencies.trace_runner or run_with_evidence
@@ -995,7 +997,7 @@ class AgentService:
                     (request, result, memory_context),
                 )
             )
-        if self.dependencies.trace_recorder:
+        if (self.dependencies.trace_recorder and get_active_lease() is None):
             recorders.append(
                 ("trace", self.dependencies.trace_recorder, (request, result))
             )

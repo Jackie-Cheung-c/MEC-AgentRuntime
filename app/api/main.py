@@ -39,7 +39,7 @@ from app.api.capabilities import router as capabilities_router
 from app.api.travel import router as travel_router
 from config import settings
 from src.agent.service import UnsupportedAttachmentError
-from src.agent.travel_agent import close_default_checkpointer
+from src.agent.agent_core import close_default_checkpointer
 from src.attachments.factory import (
     VLMConfigurationError,
     get_default_attachment_service,

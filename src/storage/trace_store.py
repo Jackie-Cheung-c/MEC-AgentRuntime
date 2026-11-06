@@ -13,6 +13,32 @@ from uuid import UUID
 from src.domain import AgentRunRequest, AgentRunResult, ExecutionTrace, TraceSpan
 from src.paths import DATA_DIR
 
+from contextvars import ContextVar
+from dataclasses import dataclass
+
+@dataclass(frozen=True, slots=True)
+class TaskLease:
+    request_id: str
+    worker_id: str
+    epoch: int
+
+class LeaseLostError(RuntimeError):
+    """当前 Worker 已经失去任务租约。"""
+
+_ACTIVE_LEASE: ContextVar[TaskLease | None] = ContextVar(
+    "active_task_lease",
+    default=None,
+)
+@contextmanager
+def bind_lease(lease: TaskLease):
+    token = _ACTIVE_LEASE.set(lease)
+    try:
+        yield lease
+    finally:
+        _ACTIVE_LEASE.reset(token)
+
+def get_active_lease() -> TaskLease | None:
+    return _ACTIVE_LEASE.get()
 
 class SQLiteTraceStore:
     """Persist complete runs and normalized spans in a local SQLite database.
@@ -130,6 +156,7 @@ class SQLiteTraceStore:
                     available_at TEXT NOT NULL,
                     lease_owner TEXT,
                     lease_expires_at TEXT,
+                    lease_epoch INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     max_attempts INTEGER NOT NULL DEFAULT 3,
                     last_error TEXT,
@@ -169,6 +196,14 @@ class SQLiteTraceStore:
                 )
             self._backfill_agent_tasks(connection)
 
+            task_columns = {
+                row["name"] for row in connection.execute("PRAGMA table_info(agent_tasks)").fetchall()
+            }
+            if "lease_epoch" not in task_columns:
+                connection.execute(
+                    "ALTER TABLE agent_tasks "
+                    "ADD COLUMN lease_epoch INTEGER NOT NULL DEFAULT 0"
+                )
     @staticmethod
     def _backfill_agent_tasks(connection: sqlite3.Connection) -> None:
         """Adopt unfinished runs created before the durable queue existed."""
@@ -336,6 +371,7 @@ class SQLiteTraceStore:
                 SET status = 'running',
                     lease_owner = ?,
                     lease_expires_at = ?,
+                    lease_epoch = lease_epoch + 1,
                     attempts = attempts + 1,
                     updated_at = ?
                 WHERE request_id = ? AND status = 'queued'
@@ -372,25 +408,35 @@ class SQLiteTraceStore:
         request_id: UUID | str,
         worker_id: str,
         lease_seconds: int,
+        lease: TaskLease | None = None,
     ) -> bool:
         now = datetime.now(timezone.utc)
         now_text = now.isoformat()
         lease_expires_text = datetime.fromtimestamp(
             now.timestamp() + max(1, lease_seconds), timezone.utc
         ).isoformat()
+        lease = lease or get_active_lease()
+        if lease is None:
+            return False
+
+        if lease.worker_id != worker_id:
+            return False
         with self._connect() as connection:
             cursor = connection.execute(
                 """
                 UPDATE agent_tasks
                 SET lease_expires_at = ?, updated_at = ?
                 WHERE request_id = ? AND status = 'running'
-                  AND lease_owner = ?
+                  AND lease_owner = ? AND lease_epoch = ?
+                  AND lease_expires_at > ?
                 """,
                 (
                     lease_expires_text,
                     now_text,
                     str(request_id),
                     worker_id,
+                    lease.epoch if lease else None,
+                    now_text,
                 ),
             )
             if cursor.rowcount != 1:
@@ -412,6 +458,7 @@ class SQLiteTraceStore:
         worker_id: str,
         status: str,
         error: str | None = None,
+        lease: TaskLease | None = None,
     ) -> bool:
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
@@ -424,7 +471,8 @@ class SQLiteTraceStore:
                     last_error = ?,
                     updated_at = ?
                 WHERE request_id = ? AND status = 'running'
-                  AND lease_owner = ?
+                  AND lease_owner = ? AND lease_epoch = ?
+                  AND lease_expires_at > ?
                 """,
                 (
                     status,
@@ -432,6 +480,8 @@ class SQLiteTraceStore:
                     now,
                     str(request_id),
                     worker_id,
+                    lease.epoch if lease else None,
+                    now,
                 ),
             )
             if cursor.rowcount != 1:
@@ -446,19 +496,37 @@ class SQLiteTraceStore:
         error: str,
         retry_delay_seconds: float,
         retry: bool = True,
+        lease: TaskLease | None = None,
     ) -> bool:
         """Requeue a failed lease when attempts remain, otherwise fail it."""
         now = datetime.now(timezone.utc)
         now_text = now.isoformat()
+
         with self._connect() as connection:
+            lease = lease or get_active_lease()
+            if lease is None:
+                return False
+
+            if lease.worker_id != worker_id:
+                return False
+
             self._begin_immediate(connection)
             row = connection.execute(
                 """
-                SELECT attempts, max_attempts FROM agent_tasks
-                WHERE request_id = ? AND status = 'running'
-                  AND lease_owner = ?
+                SELECT attempts, max_attempts
+                FROM agent_tasks
+                WHERE request_id = ?
+                AND status = 'running'
+                AND lease_owner = ?
+                AND lease_epoch = ?
+                AND lease_expires_at > ?
                 """,
-                (str(request_id), worker_id),
+                (
+                    str(request_id),
+                    lease.worker_id,
+                    lease.epoch,
+                    now_text,
+                ),
             ).fetchone()
             if row is None:
                 return False
@@ -475,6 +543,7 @@ class SQLiteTraceStore:
                         available_at = ?,
                         lease_owner = NULL,
                         lease_expires_at = NULL,
+                        lease_epoch = lease_epoch + 1,
                         last_error = ?,
                         updated_at = ?
                     WHERE request_id = ?
@@ -503,6 +572,7 @@ class SQLiteTraceStore:
                 SET status = 'failed',
                     lease_owner = NULL,
                     lease_expires_at = NULL,
+                    lease_epoch = lease_epoch + 1,
                     last_error = ?,
                     updated_at = ?
                 WHERE request_id = ?
@@ -564,6 +634,7 @@ class SQLiteTraceStore:
                         SET status = ?,
                             lease_owner = NULL,
                             lease_expires_at = NULL,
+                            lease_epoch = lease_epoch + 1, 
                             updated_at = ?
                         WHERE request_id = ?
                         """,
@@ -578,6 +649,7 @@ class SQLiteTraceStore:
                             available_at = ?,
                             lease_owner = NULL,
                             lease_expires_at = NULL,
+                            lease_epoch = lease_epoch + 1, 
                             last_error = 'worker lease expired',
                             updated_at = ?
                         WHERE request_id = ?
@@ -601,6 +673,7 @@ class SQLiteTraceStore:
                         SET status = 'failed',
                             lease_owner = NULL,
                             lease_expires_at = NULL,
+                            lease_epoch = lease_epoch + 1, 
                             last_error = 'worker lease expired; attempts exhausted',
                             updated_at = ?
                         WHERE request_id = ?
@@ -624,9 +697,22 @@ class SQLiteTraceStore:
         request_id: UUID | str,
         event_type: str,
         payload: dict[str, Any],
+        lease: TaskLease | None = None,
     ) -> int:
+        lease = lease or get_active_lease()
         now = datetime.now(timezone.utc).isoformat()
+
         with self._connect() as connection:
+            if lease is not None:
+                self._begin_immediate(connection)
+                if not self._owns_lease(
+                    connection,
+                    request_id=request_id,
+                    lease=lease,
+                    now_text=now,
+                ):
+                    return 0
+
             cursor = connection.execute(
                 """
                 INSERT INTO agent_events (
@@ -676,6 +762,16 @@ class SQLiteTraceStore:
         """Create an idempotent durable ledger row before Agent execution."""
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
+            lease = get_active_lease()
+            if lease is not None:
+                self._begin_immediate(connection)
+                if not self._owns_lease(
+                    connection,
+                    request_id=request.request_id,
+                    lease=lease,
+                    now_text=now,
+                ):
+                    return
             connection.execute(
                 """
                 INSERT INTO agent_runs (
@@ -703,6 +799,16 @@ class SQLiteTraceStore:
         """Upsert one incrementally observed model/tool step."""
         now = datetime.now(timezone.utc).isoformat()
         with self._connect() as connection:
+            lease = get_active_lease()
+            if lease is not None:
+                self._begin_immediate(connection)
+                if not self._owns_lease(
+                    connection,
+                    request_id=request_id,
+                    lease=lease,
+                    now_text=now,
+                ):
+                    return 
             connection.execute(
                 """
                 INSERT INTO agent_steps (
@@ -816,168 +922,13 @@ class SQLiteTraceStore:
         return [dict(row) for row in rows]
 
     def record(self, request: AgentRunRequest, result: AgentRunResult) -> None:
-        """Atomically persist a run and all of its spans."""
-        trace = result.trace
-        if trace is None:
-            return
+        if get_active_lease() is not None:
+            raise LeaseLostError(
+                "Leased run must use commit_result_and_finish"
+            )
 
-        trace_id = str(trace.trace_id)
-        trace_json = trace.model_dump_json()
-        trip_id = result.trip_state.trip_id if result.trip_state else request.trip_id
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO agent_runs (
-                    request_id, user_id, thread_id, status, request_json,
-                    result_json, error, started_at, updated_at, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(request_id) DO UPDATE SET
-                    user_id = excluded.user_id,
-                    thread_id = excluded.thread_id,
-                    status = excluded.status,
-                    request_json = excluded.request_json,
-                    result_json = excluded.result_json,
-                    error = excluded.error,
-                    updated_at = excluded.updated_at,
-                    heartbeat_at = excluded.updated_at,
-                    completed_at = excluded.completed_at
-                """,
-                (
-                    str(request.request_id),
-                    request.user_id,
-                    request.thread_id,
-                    result.status.value,
-                    request.model_dump_json(),
-                    result.model_dump_json(),
-                    result.error,
-                    trace.started_at.isoformat(),
-                    datetime.now(timezone.utc).isoformat(),
-                    (
-                        result.completed_at.isoformat()
-                        if result.completed_at
-                        else None
-                    ),
-                    ),
-                )
-            # request_id is the business identity of one run; a worker retry
-            # replaces the previous attempt's trace instead of violating the
-            # unique request index with a new trace_id.
-            connection.execute(
-                "DELETE FROM trace_runs WHERE request_id = ?",
-                (str(request.request_id),),
-            )
-            connection.execute(
-                """
-                INSERT INTO trace_runs (
-                    trace_id, run_id, request_id, user_id, thread_id, query,
-                    trip_id, status, answer, error, started_at, completed_at,
-                    trace_json, result_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(trace_id) DO UPDATE SET
-                    run_id=excluded.run_id,
-                    request_id=excluded.request_id,
-                    user_id=excluded.user_id,
-                    thread_id=excluded.thread_id,
-                    query=excluded.query,
-                    trip_id=excluded.trip_id,
-                    status=excluded.status,
-                    answer=excluded.answer,
-                    error=excluded.error,
-                    started_at=excluded.started_at,
-                    completed_at=excluded.completed_at,
-                    trace_json=excluded.trace_json,
-                    result_json=excluded.result_json
-                """,
-                (
-                    trace_id,
-                    str(result.run_id),
-                    str(request.request_id),
-                    request.user_id,
-                    request.thread_id,
-                    request.query or "",
-                    str(trip_id) if trip_id else None,
-                    result.status.value,
-                    result.answer,
-                    result.error,
-                    trace.started_at.isoformat(),
-                    trace.completed_at.isoformat() if trace.completed_at else None,
-                    trace_json,
-                    result.model_dump_json(),
-                ),
-            )
-            connection.execute(
-                "DELETE FROM trace_spans WHERE trace_id = ?", (trace_id,)
-            )
-            connection.executemany(
-                """
-                INSERT INTO trace_spans (
-                    trace_id, span_id, parent_span_ids_json, name, kind, status,
-                    input_json, output_json, error, started_at, completed_at,
-                    duration_ms, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (
-                        trace_id,
-                        span.span_id,
-                        json.dumps(span.parent_span_ids, ensure_ascii=False),
-                        span.name,
-                        span.kind.value,
-                        span.status.value,
-                        self._json_dump(span.input),
-                        self._json_dump(span.output),
-                        span.error,
-                        span.started_at.isoformat(),
-                        span.completed_at.isoformat() if span.completed_at else None,
-                        span.duration_ms,
-                        json.dumps(span.metadata, ensure_ascii=False),
-                    )
-                    for span in trace.spans
-                ],
-            )
-            for span in trace.spans:
-                connection.execute(
-                    """
-                    INSERT INTO agent_steps (
-                        request_id, step_id, parent_step_ids_json, kind, name,
-                        status, input_json, output_json, error, started_at,
-                        completed_at, duration_ms, metadata_json, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(request_id, step_id) DO UPDATE SET
-                        parent_step_ids_json = excluded.parent_step_ids_json,
-                        kind = excluded.kind,
-                        name = excluded.name,
-                        status = excluded.status,
-                        input_json = excluded.input_json,
-                        output_json = excluded.output_json,
-                        error = excluded.error,
-                        started_at = excluded.started_at,
-                        completed_at = excluded.completed_at,
-                        duration_ms = excluded.duration_ms,
-                        metadata_json = excluded.metadata_json,
-                        updated_at = excluded.updated_at
-                    """,
-                    (
-                        str(request.request_id),
-                        span.span_id,
-                        json.dumps(span.parent_span_ids, ensure_ascii=False),
-                        span.kind.value,
-                        span.name,
-                        span.status.value,
-                        self._json_dump(span.input),
-                        self._json_dump(span.output),
-                        span.error,
-                        span.started_at.isoformat(),
-                        (
-                            span.completed_at.isoformat()
-                            if span.completed_at
-                            else None
-                        ),
-                        span.duration_ms,
-                        json.dumps(span.metadata, ensure_ascii=False),
-                        datetime.now(timezone.utc).isoformat(),
-                    ),
-                )
+            self._write_result_rows(connection, request, result)
 
     def get_trace(self, trace_id: UUID | str) -> ExecutionTrace | None:
         """Load a trace after process restart."""
@@ -1119,3 +1070,270 @@ class SQLiteTraceStore:
     @staticmethod
     def _json_dump(value: Any) -> str | None:
         return None if value is None else json.dumps(value, ensure_ascii=False, default=str)
+
+
+    # lease校验 status\lease_owner\lease_epoch\lease_expires_at都校验
+    def _owns_lease(
+        self,
+        connection,
+        *,
+        request_id,
+        lease: TaskLease,
+        now_text: str,
+    ) -> bool:
+        if str(request_id) != lease.request_id:
+            return False
+
+        row = connection.execute(
+            """
+            SELECT 1
+            FROM agent_tasks
+            WHERE request_id = ?
+            AND status = 'running'
+            AND lease_owner = ?
+            AND lease_epoch = ?
+            AND lease_expires_at IS NOT NULL
+            AND lease_expires_at > ?
+            """,
+            (
+                str(request_id),
+                lease.worker_id,
+                lease.epoch,
+                now_text,
+            ),
+        ).fetchone()
+        return row is not None
+
+
+    def lease_is_current(self, lease: TaskLease) -> bool:
+        now_text = datetime.now(timezone.utc).isoformat()
+        with self._connect() as connection:
+            return self._owns_lease(
+                connection,
+                request_id=lease.request_id,
+                lease=lease,
+                now_text=now_text,
+            )
+
+    def _write_result_rows(self,connection,request,result):
+        trace = result.trace
+        if trace is None:
+            return
+
+        trace_id = str(trace.trace_id)
+        trace_json = trace.model_dump_json()
+        trip_id = result.trip_state.trip_id if result.trip_state else request.trip_id
+        
+        connection.execute(
+            """
+            INSERT INTO agent_runs (
+                request_id, user_id, thread_id, status, request_json,
+                result_json, error, started_at, updated_at, completed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(request_id) DO UPDATE SET
+                user_id = excluded.user_id,
+                thread_id = excluded.thread_id,
+                status = excluded.status,
+                request_json = excluded.request_json,
+                result_json = excluded.result_json,
+                error = excluded.error,
+                updated_at = excluded.updated_at,
+                heartbeat_at = excluded.updated_at,
+                completed_at = excluded.completed_at
+            """,
+            (
+                str(request.request_id),
+                request.user_id,
+                request.thread_id,
+                result.status.value,
+                request.model_dump_json(),
+                result.model_dump_json(),
+                result.error,
+                trace.started_at.isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+                (
+                    result.completed_at.isoformat()
+                    if result.completed_at
+                    else None
+                ),
+                ),
+            )
+            # request_id is the business identity of one run; a worker retry
+            # replaces the previous attempt's trace instead of violating the
+            # unique request index with a new trace_id.
+        connection.execute(
+            "DELETE FROM trace_runs WHERE request_id = ?",
+            (str(request.request_id),),
+        )
+        connection.execute(
+            """
+            INSERT INTO trace_runs (
+                trace_id, run_id, request_id, user_id, thread_id, query,
+                trip_id, status, answer, error, started_at, completed_at,
+                trace_json, result_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(trace_id) DO UPDATE SET
+                run_id=excluded.run_id,
+                request_id=excluded.request_id,
+                user_id=excluded.user_id,
+                thread_id=excluded.thread_id,
+                query=excluded.query,
+                trip_id=excluded.trip_id,
+                status=excluded.status,
+                answer=excluded.answer,
+                error=excluded.error,
+                started_at=excluded.started_at,
+                completed_at=excluded.completed_at,
+                trace_json=excluded.trace_json,
+                result_json=excluded.result_json
+            """,
+            (
+                trace_id,
+                str(result.run_id),
+                str(request.request_id),
+                request.user_id,
+                request.thread_id,
+                request.query or "",
+                str(trip_id) if trip_id else None,
+                result.status.value,
+                result.answer,
+                result.error,
+                trace.started_at.isoformat(),
+                trace.completed_at.isoformat() if trace.completed_at else None,
+                trace_json,
+                result.model_dump_json(),
+            ),
+        )
+        connection.execute(
+            "DELETE FROM trace_spans WHERE trace_id = ?", (trace_id,)
+        )
+        connection.executemany(
+            """
+            INSERT INTO trace_spans (
+                trace_id, span_id, parent_span_ids_json, name, kind, status,
+                input_json, output_json, error, started_at, completed_at,
+                duration_ms, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    trace_id,
+                    span.span_id,
+                    json.dumps(span.parent_span_ids, ensure_ascii=False),
+                    span.name,
+                    span.kind.value,
+                    span.status.value,
+                    self._json_dump(span.input),
+                    self._json_dump(span.output),
+                    span.error,
+                    span.started_at.isoformat(),
+                    span.completed_at.isoformat() if span.completed_at else None,
+                    span.duration_ms,
+                    json.dumps(span.metadata, ensure_ascii=False),
+                )
+                for span in trace.spans
+            ],
+        )
+        for span in trace.spans:
+            connection.execute(
+                """
+                INSERT INTO agent_steps (
+                    request_id, step_id, parent_step_ids_json, kind, name,
+                    status, input_json, output_json, error, started_at,
+                    completed_at, duration_ms, metadata_json, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(request_id, step_id) DO UPDATE SET
+                    parent_step_ids_json = excluded.parent_step_ids_json,
+                    kind = excluded.kind,
+                    name = excluded.name,
+                    status = excluded.status,
+                    input_json = excluded.input_json,
+                    output_json = excluded.output_json,
+                    error = excluded.error,
+                    started_at = excluded.started_at,
+                    completed_at = excluded.completed_at,
+                    duration_ms = excluded.duration_ms,
+                    metadata_json = excluded.metadata_json,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    str(request.request_id),
+                    span.span_id,
+                    json.dumps(span.parent_span_ids, ensure_ascii=False),
+                    span.kind.value,
+                    span.name,
+                    span.status.value,
+                    self._json_dump(span.input),
+                    self._json_dump(span.output),
+                    span.error,
+                    span.started_at.isoformat(),
+                    (
+                        span.completed_at.isoformat()
+                        if span.completed_at
+                        else None
+                    ),
+                    span.duration_ms,
+                    json.dumps(span.metadata, ensure_ascii=False),
+                    datetime.now(timezone.utc).isoformat(),
+                ),
+            )
+
+    def commit_result_and_finish(
+        self,
+        request: AgentRunRequest,
+        result: AgentRunResult,
+        *,
+        lease: TaskLease,
+    ) -> bool:
+        """只有当前租约持有者才能提交结果并结束任务。"""
+        now_text = datetime.now(timezone.utc).isoformat()
+        task_status = (
+            "failed"
+            if result.status.value == "failed"
+            else "succeeded"
+        )
+
+        with self._connect() as connection:
+            self._begin_immediate(connection)
+
+            if not self._owns_lease(
+                connection,
+                request_id=request.request_id,
+                lease=lease,
+                now_text=now_text,
+            ):
+                return False
+
+            self._write_result_rows(connection, request, result)
+
+            cursor = connection.execute(
+                """
+                UPDATE agent_tasks
+                SET status = ?,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    last_error = ?,
+                    updated_at = ?
+                WHERE request_id = ?
+                AND status = 'running'
+                AND lease_owner = ?
+                AND lease_epoch = ?
+                AND lease_expires_at > ?
+                """,
+                (
+                    task_status,
+                    result.error,
+                    now_text,
+                    str(request.request_id),
+                    lease.worker_id,
+                    lease.epoch,
+                    now_text,
+                ),
+            )
+
+            if cursor.rowcount != 1:
+                raise LeaseLostError(
+                    "任务在最终提交前已经被其他 Worker 接管"
+                )
+
+        return True

@@ -1,5 +1,3 @@
-"""Public TravelOps domain contracts."""
-
 from src.domain.attachments import (
     Attachment,
     AttachmentKind,
@@ -15,6 +13,11 @@ from src.domain.evidence import (
     ExtractedDocument,
     ExtractedField,
     ExtractionStatus,
+)
+from src.domain.extraction import (
+    ExtractionDocumentType,
+    ExtractionPolicy,
+    general_extraction_policy,
 )
 from src.domain.runs import (
     AgentRunRequest,
@@ -59,6 +62,13 @@ from src.domain.travel import (
     TravelItemKind,
     TravelItemStatus,
     TripState,
+)
+
+from src.domain.state import (
+    AgentArtifact,
+    AgentEvent,
+    StateEnvelope,
+    StateMutation
 )
 
 __all__ = [
@@ -108,4 +118,11 @@ __all__ = [
     "TravelItemKind",
     "TravelItemStatus",
     "TripState",
+    "AgentArtifact",
+    "AgentEvent",
+    "StateEnvelope",
+    "StateMutation",
+    "ExtractionDocumentType",
+    "ExtractionPolicy",
+    "general_extraction_policy",
 ]

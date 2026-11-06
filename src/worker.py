@@ -20,11 +20,11 @@ from typing import Any
 
 from config import settings
 from src.agent.service import TravelOpsService, UnsupportedAttachmentError
-from src.agent.travel_agent import close_default_checkpointer
+from src.agent.agent_core import close_default_checkpointer
 from src.domain import AgentRunRequest, RunStatus
-from src.storage.trace_store import SQLiteTraceStore
+from src.storage.trace_store import LeaseLostError, SQLiteTraceStore
 from src.tracing.execution_trace import stream_text
-
+from src.storage.trace_store import SQLiteTraceStore,TaskLease,bind_lease
 
 logger = logging.getLogger(__name__)
 
@@ -114,16 +114,22 @@ class AgentWorker:
         )
         if task is None:
             return False
+        lease = TaskLease(
+            request_id=str(task["request_id"]),
+            worker_id=self.worker_id,
+            epoch=int(task["lease_epoch"]),
+        )
         logger.info(
             "[领到任务] worker=%s|request_id=%s|租约到期=%s",
             self.worker_id,
             task.get("request_id"),
             task.get("lease_expires_at"),
         )
-        await self._execute(task)
+        with bind_lease(lease):
+            await self._execute(task, lease)
         return True
 
-    async def _execute(self, task: dict[str, Any]) -> None:
+    async def _execute(self, task: dict[str, Any],lease: TaskLease,) -> None:
         request = AgentRunRequest.model_validate_json(task["request_json"])
         request_id = str(request.request_id)
         attempt = int(task.get("attempts") or 1)
@@ -143,6 +149,7 @@ class AgentWorker:
                 request_id,
                 "done",
                 {"result": existing},
+                lease=lease,
             )
             await asyncio.to_thread(
                 self.store.finish_task,
@@ -154,6 +161,7 @@ class AgentWorker:
                     else "failed"
                 ),
                 error=existing.get("error"),
+                lease=lease,
             )
             return
 
@@ -164,6 +172,7 @@ class AgentWorker:
                 request_id,
                 "reset",
                 {"attempt": attempt},
+                lease=lease,
             )
 
         event_queue: asyncio.Queue[
@@ -181,6 +190,7 @@ class AgentWorker:
                     request_id,
                     event_type,
                     payload,
+                    lease=lease,
                 )
 
         def on_event(event: dict[str, Any]) -> None:
@@ -190,10 +200,11 @@ class AgentWorker:
 
         flusher = asyncio.create_task(flush_events())
         heartbeat_stop = threading.Event()
+        lease_lost = threading.Event()  
         # 独立线程续租
         heartbeat = threading.Thread(
             target=self._heartbeat_loop,
-            args=(request_id, heartbeat_stop),
+            args=(lease,request_id, heartbeat_stop, lease_lost),
             daemon=True,
             name=f"agent-heartbeat-{request_id[:8]}",
         )
@@ -202,11 +213,26 @@ class AgentWorker:
         failure: Exception | None = None
         try:
             logger.info("[调用agent] request_id=%s|执行次数=%s|是否属于恢复=%s", request_id, attempt, attempt > 1)
-            result = await self.service.run(
-                request,
-                on_event=on_event,
-                recover=attempt > 1,
+            run_task = asyncio.create_task(
+                self.service.run(
+                    request,
+                    on_event=on_event,
+                    recover=attempt > 1,
+                )
             )
+            while not run_task.done():
+                if lease_lost.is_set():
+                    run_task.cancel()
+                    try:
+                        await run_task
+                    except asyncio.CancelledError:
+                        pass
+                    raise LeaseLostError(
+                        f"Worker {self.worker_id} lost lease for {request_id}"
+                    )
+                await asyncio.sleep(0.1)
+
+            result = await run_task
             logger.info(
                 "[agent已返回] request_id=%s|状态=%s",
                 request_id,
@@ -233,6 +259,7 @@ class AgentWorker:
                     request_id,
                     "error",
                     {"error": str(failure)},
+                    lease=lease,
                 )
                 await asyncio.to_thread(
                     self.store.fail_task,
@@ -241,6 +268,7 @@ class AgentWorker:
                     error=str(failure),
                     retry_delay_seconds=self.retry_delay_seconds,
                     retry=False,
+                    lease=lease,
                 )
                 return
             requeued = await asyncio.to_thread(
@@ -250,6 +278,7 @@ class AgentWorker:
                 error=str(failure),
                 retry_delay_seconds=self.retry_delay_seconds,
                 retry=True,
+                lease=lease
             )
             if not requeued:
                 await asyncio.to_thread(
@@ -257,35 +286,33 @@ class AgentWorker:
                     request_id,
                     "error",
                     {"error": str(failure)},
+                    lease=lease,
                 )
             return
 
         assert result is not None
-        if result.trace is not None:
-            await asyncio.to_thread(self.store.record, request, result)
+        committed = await asyncio.to_thread(
+            self.store.commit_result_and_finish,
+            request,
+            result,
+            lease=lease,
+        )
+        if not committed:
+            logger.warning(
+                "[过期Worker结果丢弃] request_id=%s worker=%s epoch=%s",
+                request_id,
+                self.worker_id,
+                lease.epoch,
+            )
+            return
         logger.info("[落库完成] request_id=%s", request_id)
-        await asyncio.to_thread(
-            self.store.append_event,
-            request_id,
-            "done",
-            {},
-        )
-        await asyncio.to_thread(
-            self.store.finish_task,
-            request_id=request_id,
-            worker_id=self.worker_id,
-            status=(
-                "succeeded"
-                if result.status != RunStatus.FAILED
-                else "failed"
-            ),
-            error=result.error,
-        )
 
     def _heartbeat_loop(
         self,
+        lease: TaskLease,
         request_id: str,
         stop_event: threading.Event,
+        lease_lost: threading.Event,
     ) -> None:
         interval = max(1.0, self.lease_seconds / 3)
         while not stop_event.wait(interval):
@@ -293,8 +320,10 @@ class AgentWorker:
                 request_id=request_id,
                 worker_id=self.worker_id,
                 lease_seconds=self.lease_seconds,
+                lease=lease,
             )
             if not alive:
+                lease_lost.set()
                 logger.warning(
                     "[租约丢失，停止续租] 请求=%s worker=%s（可能已被别的worker接管）",
                     request_id, self.worker_id,

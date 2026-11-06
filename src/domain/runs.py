@@ -11,6 +11,7 @@ from pydantic import Field, JsonValue, model_validator
 from src.domain.attachments import Attachment
 from src.domain.base import DomainModel
 from src.domain.evidence import Evidence, ExtractedDocument
+from src.domain.state import AgentArtifact, AgentEvent, StateEnvelope
 from src.domain.traces import ExecutionTrace
 from src.domain.travel import TripState, TravelEvent
 
@@ -75,6 +76,8 @@ class AgentRunRequest(DomainModel):
     thread_id: str = Field(default_factory=lambda: str(uuid4()), min_length=1, max_length=255)
     query: str = Field(default="", max_length=4000)
     trip_id: UUID | None = None
+    state_adapter: str | None = Field(default=None, max_length=100)
+    state_id: UUID | None = None
     attachments: list[Attachment] = Field(default_factory=list, max_length=10)
     locale: str = Field(default="zh-CN", min_length=2, max_length=35)
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
@@ -97,7 +100,9 @@ class AgentRunResult(DomainModel):
     answer: str = ""
     selected_skill: str | None = Field(default=None, max_length=255)
     trip_state: TripState | None = None
-    events: list[TravelEvent] = Field(default_factory=list)
+    state: StateEnvelope | None = None
+    events: list[AgentEvent] = Field(default_factory=list)
+    artifacts: list[AgentArtifact] = Field(default_factory=list)
     extracted_documents: list[ExtractedDocument] = Field(default_factory=list)
     evidence: list[Evidence] = Field(default_factory=list)
     tool_calls: list[ToolCallRecord] = Field(default_factory=list)
