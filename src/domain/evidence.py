@@ -19,6 +19,18 @@ class EvidenceSource(StrEnum):
     USER = "user"
     AGENT = "agent"
 
+class EvidenceSafety(StrEnum):
+    CLEAN = "clean"
+    SUSPICIOUS = "suspicious"
+    QUARANTINED = "quarantined"
+
+
+class GroundingStatus(StrEnum):
+    NOT_CHECKED = "not_checked"
+    NOT_APPLICABLE = "not_applicable"
+    MODEL_TRANSCRIPT_MATCH = "model_transcript_match"
+    UNGROUNDED = "ungrounded"
+
 
 class BoundingBox(DomainModel):
     """基于左上角的归一化边界框（坐标值域 [0, 1]）"""
@@ -61,11 +73,17 @@ class Evidence(DomainModel):
     evidence_id: UUID = Field(default_factory=uuid4)
     source: EvidenceSource
     source_id: str = Field(min_length=1, max_length=255)
+    # 原始证据
     content: str = Field(min_length=1, max_length=8000)
+    # 安全证据，供模型和普通展示使用
+    redacted_content: str | None = Field(default=None, max_length=8000)
     confidence: float = Field(default=1.0, ge=0, le=1)
     locator: EvidenceLocator | None = None
     observed_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     metadata: dict[str, JsonValue] = Field(default_factory=dict)
+    safety_status: EvidenceSafety = EvidenceSafety.CLEAN
+    grounding_status: GroundingStatus = GroundingStatus.NOT_CHECKED
+    risk_types: list[str] = Field(default_factory=list)
 
 # 提取字段
 class ExtractedField(DomainModel):
@@ -105,6 +123,7 @@ class ExtractedDocument(DomainModel):
     fields: list[ExtractedField] = Field(default_factory=list)
     evidence_ids: list[UUID] = Field(default_factory=list)
     raw_text: str | None = Field(default=None, max_length=50000)
+    raw_text_redacted: str | None = Field(default=None, max_length=50000)
     extractor: str | None = Field(default=None, max_length=100)
     extractor_version: str | None = Field(default=None, max_length=100)
     warnings: list[str] = Field(default_factory=list)

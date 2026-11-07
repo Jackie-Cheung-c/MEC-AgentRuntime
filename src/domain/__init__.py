@@ -13,6 +13,8 @@ from src.domain.evidence import (
     ExtractedDocument,
     ExtractedField,
     ExtractionStatus,
+    EvidenceSafety,
+    GroundingStatus,
 )
 from src.domain.extraction import (
     ExtractionDocumentType,
@@ -71,6 +73,9 @@ from src.domain.state import (
     StateMutation
 )
 
+
+
+
 __all__ = [
     "AgentRunRequest",
     "AgentRunResult",
@@ -125,4 +130,6 @@ __all__ = [
     "ExtractionDocumentType",
     "ExtractionPolicy",
     "general_extraction_policy",
+    "EvidenceSafety",
+    "GroundingStatus",
 ]

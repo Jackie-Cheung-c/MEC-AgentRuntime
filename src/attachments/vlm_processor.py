@@ -23,9 +23,16 @@ from src.domain import (
     ExtractedDocument,
     ExtractedField,
     ExtractionStatus,
+    
 )
 from src.domain.base import DomainModel
 
+from src.domain.evidence import EvidenceSafety,GroundingStatus
+from src.security.evidence_safety import (
+    combine_scan_results,
+    grounding_status_for,
+    scan_text,
+)
 
 class VLMFieldExtraction(DomainModel):
     """One field returned by the model before trusted evidence IDs are assigned."""
@@ -339,12 +346,23 @@ class ImageVLMProcessor:
         evidence: list[Evidence] = []
         evidence_ids = []
         raw_text = extraction.raw_text.strip()
+        raw_scan = scan_text(raw_text)
+        raw_redacted_parts: list[str] = []
+
         for index in range(0, len(raw_text), 8000):
+            chunk = raw_text[index:index + 8000]
+            chunk_scan = scan_text(chunk)
+            raw_redacted_parts.append(chunk_scan.redacted_content)
+
             raw_evidence = Evidence(
                 source=EvidenceSource.ATTACHMENT,
                 source_id=str(attachment.attachment_id),
-                content=raw_text[index : index + 8000],
+                content=chunk,
+                redacted_content=chunk_scan.redacted_content,
                 confidence=extraction.raw_text_confidence,
+                safety_status=chunk_scan.status,
+                grounding_status=GroundingStatus.NOT_APPLICABLE,
+                risk_types=list(chunk_scan.risk_types),
                 metadata={
                     "kind": "vlm_transcription",
                     "chunk_index": index // 8000,
@@ -354,22 +372,47 @@ class ImageVLMProcessor:
             evidence_ids.append(raw_evidence.evidence_id)
 
         fields: list[ExtractedField] = []
-        needs_review = not extraction.fields
+        needs_review = not extraction.fields or (
+            raw_scan.status != EvidenceSafety.CLEAN
+        )
         for item in extraction.fields:
+            text_scan = scan_text(item.evidence_text)
+            value_scan = scan_text(
+                str(item.value) if item.value is not None else ""
+            )
+            field_scan = combine_scan_results(text_scan, value_scan)
+            grounding = grounding_status_for(
+                item.evidence_text,
+                raw_text,
+                item.value,
+            )
+
             field_evidence = Evidence(
                 source=EvidenceSource.ATTACHMENT,
                 source_id=str(attachment.attachment_id),
                 content=item.evidence_text,
+                redacted_content=text_scan.redacted_content,
                 confidence=item.confidence,
-                locator=EvidenceLocator(bounding_box=item.bounding_box)
-                if item.bounding_box
-                else None,
-                metadata={"field_path": item.path, "kind": "vlm_field"},
+                locator=(
+                    EvidenceLocator(bounding_box=item.bounding_box)
+                    if item.bounding_box
+                    else None
+                ),
+                safety_status=field_scan.status,
+                grounding_status=grounding,
+                risk_types=list(field_scan.risk_types),
+                metadata={
+                    "field_path": item.path,
+                    "kind": "vlm_field",
+                },
             )
             evidence.append(field_evidence)
             evidence_ids.append(field_evidence.evidence_id)
             requires_confirmation = (
-                item.requires_confirmation or item.confidence < self.review_threshold
+                item.requires_confirmation
+                or item.confidence < self.review_threshold
+                or field_scan.status != EvidenceSafety.CLEAN
+                or grounding == GroundingStatus.UNGROUNDED
             )
             needs_review = needs_review or requires_confirmation
             fields.append(
@@ -385,6 +428,12 @@ class ImageVLMProcessor:
         warnings = list(extraction.warnings)
         if not extraction.fields:
             warnings.append("No verifiable structured fields were extracted.")
+        if raw_scan.status != EvidenceSafety.CLEAN:
+            warnings.append(
+                "Attachment raw text was quarantined: "
+                + ", ".join(raw_scan.risk_types)
+            )
+        
         document = ExtractedDocument(
             attachment_id=attachment.attachment_id,
             document_type=extraction.document_type,
@@ -396,6 +445,7 @@ class ImageVLMProcessor:
             fields=fields,
             evidence_ids=evidence_ids,
             raw_text=extraction.raw_text,
+            raw_text_redacted="".join(raw_redacted_parts),
             extractor=self.extractor_name,
             extractor_version=self.extractor_version,
             warnings=warnings,

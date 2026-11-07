@@ -556,7 +556,7 @@ function renderExtraction(record) {
     const confidence = document.createElement('div'); confidence.className = `confidence${field.confidence < .8 ? ' low' : ''}`; const percent = Math.round(field.confidence * 100); confidence.innerHTML = `<span>${percent}%</span><span class="confidence-track"><i style="width:${percent}%"></i></span>`; head.append(path, confidence);
     let input; if (typeof field.value === 'boolean') { input = document.createElement('select'); input.innerHTML = '<option value="true">是</option><option value="false">否</option>'; input.value = String(field.value); } else { input = document.createElement('input'); input.type = typeof field.value === 'number' ? 'number' : 'text'; input.value = valueForInput(field.value); }
     input.className = 'field-input'; input.dataset.path = field.path; input.addEventListener('input', () => markChanged(item, input, field)); input.addEventListener('focus', () => selectEvidence(item, evidence)); item.append(head, input);
-    if (evidence) { const quote = document.createElement('p'); quote.className = 'evidence-quote'; quote.textContent = evidence.content; item.append(quote); }
+    if (evidence) {const quote = document.createElement('p');quote.className = 'evidence-quote';quote.textContent = evidence.redacted_content ?? evidence.content;item.append(quote);}
     if (field.requires_confirmation) { const flag = document.createElement('span'); flag.className = 'review-flag'; flag.textContent = '需要确认'; item.append(flag); }
     item.addEventListener('click', () => selectEvidence(item, evidence)); list.append(item);
   });
